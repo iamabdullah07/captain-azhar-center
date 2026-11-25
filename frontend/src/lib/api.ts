@@ -19,7 +19,6 @@ export interface CreatedQrRecord {
   targetUrl?: string;
   sizeBytes?: number;
   createdAt: number;
-  nextReservation?: ReservedShortId;
 }
 
 export interface ApiCapabilities {
@@ -27,11 +26,9 @@ export interface ApiCapabilities {
   wordToPdfEnabled: boolean;
 }
 
-export interface ReservedShortId {
-  id: string;
-  shortUrl: string;
-  reserveToken: string;
-  expiresAt: number;
+export interface ConvertedWordResult {
+  pdfBytes: Uint8Array;
+  uploadTicket?: string;
 }
 
 const MAX_NETWORK_RETRIES = 3;
@@ -131,23 +128,6 @@ export async function fetchApiCapabilities(): Promise<ApiCapabilities> {
   }
 }
 
-export async function reserveShortId(params: {
-  sourceId?: string;
-  deleteToken?: string;
-  turnstileToken?: string;
-}): Promise<ReservedShortId> {
-  const res = await fetchWithRetry(`${API_BASE_URL}/api/upload/reserve`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  });
-  const data = (await res.json().catch(() => ({}))) as ReservedShortId & { error?: string };
-  if (!res.ok) {
-    throw new Error(data.error || 'Could not allocate short link ID.');
-  }
-  return data;
-}
-
 export async function createShortLink(url: string, turnstileToken: string): Promise<CreatedQrRecord> {
   const res = await fetchWithRetry(`${API_BASE_URL}/api/link`, {
     method: 'POST',
@@ -165,11 +145,10 @@ function sendSingleUploadXhr(params: {
   file: File;
   category: Exclude<InputTab, 'link'>;
   turnstileToken: string;
-  reserved?: { id: string; reserveToken: string };
-  reserveNext?: boolean;
+  convertedUploadTicket?: string;
   onProgress: (pct: number) => void;
 }): Promise<CreatedQrRecord> {
-  const { file, category, turnstileToken, reserved, reserveNext, onProgress } = params;
+  const { file, category, turnstileToken, convertedUploadTicket, onProgress } = params;
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -179,12 +158,8 @@ function sendSingleUploadXhr(params: {
     xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
     xhr.setRequestHeader('X-File-Category', category);
     xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
-    if (reserveNext) {
-      xhr.setRequestHeader('X-Reserve-Next', '1');
-    }
-    if (reserved) {
-      xhr.setRequestHeader('X-Reserved-Id', reserved.id);
-      xhr.setRequestHeader('X-Reserve-Token', reserved.reserveToken);
+    if (convertedUploadTicket) {
+      xhr.setRequestHeader('X-Converted-Upload-Ticket', convertedUploadTicket);
     }
 
     xhr.upload.onprogress = (ev) => {
@@ -222,8 +197,7 @@ export async function uploadFileWithProgress(params: {
   file: File;
   category: Exclude<InputTab, 'link'>;
   turnstileToken: string;
-  reserved?: { id: string; reserveToken: string };
-  reserveNext?: boolean;
+  convertedUploadTicket?: string;
   onProgress: (pct: number) => void;
 }): Promise<CreatedQrRecord> {
   let lastErr: unknown;
@@ -246,12 +220,10 @@ export async function uploadFileWithProgress(params: {
 
 export async function convertWordToPdf(params: {
   file: File;
-  sourceId?: string;
-  deleteToken?: string;
   turnstileToken?: string;
   onProgress?: (pct: number) => void;
-}): Promise<Uint8Array> {
-  const { file, sourceId, deleteToken, turnstileToken = '', onProgress } = params;
+}): Promise<ConvertedWordResult> {
+  const { file, turnstileToken = '', onProgress } = params;
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -260,12 +232,7 @@ export async function convertWordToPdf(params: {
 
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
-    if (sourceId && deleteToken) {
-      xhr.setRequestHeader('X-Source-Id', sourceId);
-      xhr.setRequestHeader('X-Delete-Token', deleteToken);
-    } else {
-      xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
-    }
+    xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
 
     xhr.upload.onprogress = (ev) => {
       if (onProgress && ev.lengthComputable && ev.total > 0) {
@@ -276,7 +243,11 @@ export async function convertWordToPdf(params: {
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300 && xhr.response instanceof ArrayBuffer) {
         onProgress?.(100);
-        resolve(new Uint8Array(xhr.response));
+        const uploadTicket = xhr.getResponseHeader('X-Converted-Upload-Ticket')?.trim() || undefined;
+        resolve({
+          pdfBytes: new Uint8Array(xhr.response),
+          uploadTicket,
+        });
         return;
       }
       let message = `Word conversion failed (${xhr.status})`;

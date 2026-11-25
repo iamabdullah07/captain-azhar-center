@@ -55,7 +55,9 @@ export function createApp() {
         'X-Reserve-Token',
         'X-Reserve-Next',
         'X-Source-Id',
+        'X-Converted-Upload-Ticket',
       ],
+      exposeHeaders: ['X-Converted-Upload-Ticket'],
       credentials: true,
       maxAge: 86400,
     });

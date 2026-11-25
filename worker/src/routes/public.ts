@@ -4,6 +4,7 @@ import {
   constantTimeEqualStr,
   generateRandomToken,
   generateShortId,
+  hmacSign,
   sha256Hex,
 } from '../services/cryptoUtils';
 import { FILE_SIZE_LIMITS, validateUploadedFileHeader } from '../services/magicBytes';
@@ -28,6 +29,7 @@ import { renderOfficeViewerHtml, type OfficeExtension } from '../views/officeVie
 const HOUR_MS = 60 * 60 * 1000;
 const RESERVATION_TTL_MS = 30 * 60 * 1000;
 const SOURCE_TICKET_TTL_MS = 2 * HOUR_MS;
+const CONVERTED_TICKET_TTL_MS = 5 * 60 * 1000;
 const HEADER_PROBE_LIMIT = 16 * 1024; // 16 KB magic-byte peek
 
 const OFFICE_MIME_TO_EXT: Record<string, OfficeExtension> = {
@@ -150,6 +152,50 @@ async function verifySourceUploadTicket(params: {
   if (!row.delete_token_hash) return false;
   const incomingHash = await sha256Hex(deleteToken);
   return constantTimeEqualStr(incomingHash, row.delete_token_hash);
+}
+
+function getConvertedTicketSecret(env: Env): string {
+  return (env.SESSION_SECRET || env.TURNSTILE_SECRET_KEY || '').trim();
+}
+
+async function createConvertedPdfUploadTicket(params: {
+  secret: string;
+  sizeBytes: number;
+  ip: string;
+  now: number;
+}): Promise<string> {
+  const exp = params.now + CONVERTED_TICKET_TTL_MS;
+  const nonce = generateRandomToken(20);
+  const ipHash = await sha256Hex(params.ip);
+  const payload = `conv-pdf:${exp}:${params.sizeBytes}:${ipHash}:${nonce}`;
+  const sig = await hmacSign(payload, params.secret);
+  return `${exp}.${nonce}.${sig}`;
+}
+
+async function verifyConvertedPdfUploadTicketFormat(params: {
+  ticket: string;
+  secret: string;
+  sizeBytes: number;
+  ip: string;
+  now: number;
+}): Promise<{ ok: true; nonce: string } | { ok: false }> {
+  const parts = params.ticket.split('.');
+  if (parts.length !== 3) return { ok: false };
+  const [expStr, nonce, sig] = parts;
+  if (!/^\d+$/.test(expStr) || !/^[A-Za-z0-9_-]{10,40}$/.test(nonce) || !/^[a-f0-9]{64}$/i.test(sig)) {
+    return { ok: false };
+  }
+  const exp = Number.parseInt(expStr, 10);
+  if (!Number.isFinite(exp) || exp <= params.now) {
+    return { ok: false };
+  }
+  const ipHash = await sha256Hex(params.ip);
+  const payload = `conv-pdf:${exp}:${params.sizeBytes}:${ipHash}:${nonce}`;
+  const expectedSig = await hmacSign(payload, params.secret);
+  if (!constantTimeEqualStr(sig.toLowerCase(), expectedSig.toLowerCase())) {
+    return { ok: false };
+  }
+  return { ok: true, nonce };
 }
 
 function parseByteRange(
@@ -497,6 +543,9 @@ export function createPublicRoutes() {
     }
 
     const now = Date.now();
+    const convertedUploadTicket = (c.req.header('X-Converted-Upload-Ticket') ?? '').trim();
+    let convertedTicketNonce: string | null = null;
+
     if (reservedId) {
       const reservation = await c.env.DB
         .prepare('SELECT token_hash, expires_at, used_at FROM upload_reservations WHERE id = ?')
@@ -522,6 +571,31 @@ export function createPublicRoutes() {
         if (restReader) await restReader.cancel().catch(() => {});
         return c.json({ error: 'Reserved ID is already taken.' }, 409);
       }
+    } else if (convertedUploadTicket) {
+      const secret = getConvertedTicketSecret(c.env);
+      const checkedTicket =
+        secret && category === 'document' && getPathExtension(filename) === 'pdf'
+          ? await verifyConvertedPdfUploadTicketFormat({
+              ticket: convertedUploadTicket,
+              secret,
+              sizeBytes: declaredSize,
+              ip,
+              now,
+            })
+          : { ok: false as const };
+      if (!checkedTicket.ok) {
+        if (restReader) await restReader.cancel().catch(() => {});
+        return c.json({ error: 'Invalid or expired conversion upload ticket.' }, 403);
+      }
+      const alreadyUsed = await c.env.DB
+        .prepare('SELECT 1 FROM rate_limits WHERE key = ?')
+        .bind(`conv_ticket:${checkedTicket.nonce}`)
+        .first();
+      if (alreadyUsed) {
+        if (restReader) await restReader.cancel().catch(() => {});
+        return c.json({ error: 'Conversion upload ticket was already used.' }, 403);
+      }
+      convertedTicketNonce = checkedTicket.nonce;
     } else {
       // Verify Turnstile before accepting file bytes into R2
       const turnstile = await verifyTurnstileToken({
@@ -551,6 +625,10 @@ export function createPublicRoutes() {
     if (!validation.ok) {
       if (restReader) await restReader.cancel().catch(() => {});
       return c.json({ error: validation.error }, 400);
+    }
+    if (convertedTicketNonce && validation.meta.extension !== 'pdf') {
+      if (restReader) await restReader.cancel().catch(() => {});
+      return c.json({ error: 'Conversion upload ticket is only valid for PDF files.' }, 403);
     }
 
     // Storage space check + emergency cleanup if near 9.5 GB hard stop
@@ -584,6 +662,16 @@ export function createPublicRoutes() {
       }
       id = reservedId;
     } else {
+      if (convertedTicketNonce) {
+        const ticketClaim = await c.env.DB
+          .prepare('INSERT OR IGNORE INTO rate_limits (key, count, window_start) VALUES (?, 1, ?)')
+          .bind(`conv_ticket:${convertedTicketNonce}`, now)
+          .run();
+        if (!ticketClaim.meta.changes) {
+          if (restReader) await restReader.cancel().catch(() => {});
+          return c.json({ error: 'Conversion upload ticket was already used.' }, 403);
+        }
+      }
       id = await allocateUniqueId(c.env.DB, now);
     }
 
@@ -971,13 +1059,24 @@ export function createPublicRoutes() {
       return c.json({ error: 'Converter returned invalid PDF content.' }, 502);
     }
 
+    const responseHeaders: Record<string, string> = {
+      'Content-Type': 'application/pdf',
+      'Content-Length': String(pdfBytes.byteLength),
+      'Cache-Control': 'no-store',
+    };
+    const ticketSecret = getConvertedTicketSecret(c.env);
+    if (ticketSecret) {
+      responseHeaders['X-Converted-Upload-Ticket'] = await createConvertedPdfUploadTicket({
+        secret: ticketSecret,
+        sizeBytes: pdfBytes.byteLength,
+        ip,
+        now: Date.now(),
+      });
+    }
+
     return new Response(pdfBytes, {
       status: 200,
-      headers: {
-        'Content-Type': 'application/pdf',
-        'Content-Length': String(pdfBytes.byteLength),
-        'Cache-Control': 'no-store',
-      },
+      headers: responseHeaders,
     });
   });
 

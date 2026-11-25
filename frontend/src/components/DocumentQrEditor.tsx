@@ -25,15 +25,15 @@ import {
   ZoomOut,
 } from 'lucide-react';
 import {
-  convertWordToPdf,
   deleteUploadedItem,
   fetchApiCapabilities,
-  reserveShortId,
   TURNSTILE_SITE_KEY,
-  uploadFileWithProgress,
   type CreatedQrRecord,
-  type ReservedShortId,
 } from '../lib/api';
+import {
+  generateDocumentWithOriginalQr,
+  prepareDocumentForEditor,
+} from '../lib/documentQrFlow';
 import {
   EDITABLE_DOC_RULES,
   formatBytes,
@@ -43,26 +43,18 @@ import {
 import {
   copyPlacementToPage,
   createDefaultPage1Placement,
-  dataUrlToUint8Array,
-  embedQrIntoPdf,
   getPlacementPrintCm,
   inspectPdfForEditing,
   PT_PER_CM,
   type PdfInspectionResult,
   type PdfPlacement,
 } from '../lib/pdfEditor';
-import { generateVerifiedQr } from '../lib/qrEngine';
 import { PdfPageCanvas } from './PdfPageCanvas';
 import { TurnstileBox } from './TurnstileBox';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const ZOOM_PRESETS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3] as const;
-
-function buildOutputPdfName(originalName: string): string {
-  const clean = originalName.replace(/\.(pdf|docx?|PDF|DOCX?)$/, '') || 'document';
-  return `${clean}-with-qr.pdf`;
-}
 
 function triggerBlobDownload(blobUrl: string, filename: string) {
   const a = document.createElement('a');
@@ -90,7 +82,6 @@ export function DocumentQrEditor() {
 
   // Loaded editor session state
   const [originalRecord, setOriginalRecord] = useState<CreatedQrRecord | null>(null);
-  const [pendingReservation, setPendingReservation] = useState<ReservedShortId | null>(null);
   const [sourceKind, setSourceKind] = useState<EditableDocKind | null>(null);
   const [workingPdfBytes, setWorkingPdfBytes] = useState<Uint8Array | null>(null);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null);
@@ -106,14 +97,13 @@ export function DocumentQrEditor() {
 
   // Final generated state
   const [generating, setGenerating] = useState(false);
-  const [saveProgress, setSaveProgress] = useState(0);
   const [generatedQrDataUrl, setGeneratedQrDataUrl] = useState<string | null>(null);
-  const [finalRecord, setFinalRecord] = useState<CreatedQrRecord | null>(null);
+  const [savedPdfReady, setSavedPdfReady] = useState(false);
   const [finalPdfUrl, setFinalPdfUrl] = useState<string | null>(null);
   const [finalPdfFilename, setFinalPdfFilename] = useState('document-with-qr.pdf');
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedToken, setCopiedToken] = useState(false);
-  const [deletingFinal, setDeletingFinal] = useState(false);
+  const [deletingOriginal, setDeletingOriginal] = useState(false);
   const [deletedMessage, setDeletedMessage] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -154,7 +144,6 @@ export function DocumentQrEditor() {
       URL.revokeObjectURL(finalPdfUrl);
     }
     setOriginalRecord(null);
-    setPendingReservation(null);
     setSourceKind(null);
     setWorkingPdfBytes(null);
     setPdfDocument(null);
@@ -163,12 +152,11 @@ export function DocumentQrEditor() {
     setSelectedPlacementId(null);
     setLiveCmOverride(null);
     setGeneratedQrDataUrl(null);
-    setFinalRecord(null);
+    setSavedPdfReady(false);
     setFinalPdfUrl(null);
     setDeletedMessage(null);
     setError(null);
     setUploadProgress(0);
-    setSaveProgress(0);
   };
 
   const handleFilePicked = async (file: File | undefined) => {
@@ -218,79 +206,51 @@ export function DocumentQrEditor() {
 
     setPreparing(true);
     setUploadProgress(0);
+    let uploadedRecordToCleanup: CreatedQrRecord | null = null;
 
     try {
-      let pdfBytes: Uint8Array;
-      let preCheckedInspection: PdfInspectionResult | null = null;
-
-      if (selectedKind === 'pdf') {
-        setPrepareStage('Inspecting PDF permissions and signatures...');
-        pdfBytes = new Uint8Array(await selectedFile.arrayBuffer());
-        preCheckedInspection = await inspectPdfForEditing(pdfBytes);
-
-        setPrepareStage('Uploading original PDF...');
-        const uploaded = await uploadFileWithProgress({
-          file: selectedFile,
-          category: 'document',
-          turnstileToken,
-          reserveNext: true,
-          onProgress: setUploadProgress,
-        });
-        setOriginalRecord(uploaded);
-        setPendingReservation(uploaded.nextReservation ?? null);
-      } else {
-        setPrepareStage('Uploading Word document...');
-        const uploadedWord = await uploadFileWithProgress({
-          file: selectedFile,
-          category: 'document',
-          turnstileToken,
-          reserveNext: true,
-          onProgress: setUploadProgress,
-        });
-        setOriginalRecord(uploadedWord);
-        setPendingReservation(uploadedWord.nextReservation ?? null);
-
-        setPrepareStage('Converting Word document to PDF...');
-        setUploadProgress(0);
-        pdfBytes = await convertWordToPdf({
-          file: selectedFile,
-          sourceId: uploadedWord.id,
-          deleteToken: uploadedWord.deleteToken,
-          onProgress: setUploadProgress,
-        });
-
-        setPrepareStage('Verifying converted PDF...');
-        preCheckedInspection = await inspectPdfForEditing(pdfBytes);
-      }
+      const prepared = await prepareDocumentForEditor({
+        file: selectedFile,
+        kind: selectedKind,
+        turnstileToken,
+        onStage: setPrepareStage,
+        onProgress: setUploadProgress,
+      });
+      uploadedRecordToCleanup = prepared.originalRecord;
 
       setPrepareStage('Loading PDF pages...');
       // Pass a copy (.slice()) because pdf.js transfers the ArrayBuffer to its worker thread
-      const loadingTask = pdfjsLib.getDocument({ data: pdfBytes.slice() });
+      const loadingTask = pdfjsLib.getDocument({ data: prepared.pdfBytes.slice() });
       const loadedPdf = await loadingTask.promise;
 
-      if (!preCheckedInspection || preCheckedInspection.pageCount !== loadedPdf.numPages) {
+      if (prepared.inspection.pageCount !== loadedPdf.numPages) {
         await loadingTask.destroy().catch(() => {});
         throw new Error('Converted PDF page count did not match.');
       }
 
-      const page1 = preCheckedInspection.pages[0];
+      const page1 = prepared.inspection.pages[0];
       const defaultPlacement = createDefaultPage1Placement(page1, `qr-${crypto.randomUUID()}`);
 
       // Pick comfortable initial zoom (roughly fits ~640px viewer width without exceeding 100%)
       const page1CssAt100 = page1.displayedWidthPt * (96 / 72);
       const fitZoom = page1CssAt100 > 680 ? Number(Math.max(0.5, Math.min(1, 640 / page1CssAt100)).toFixed(2)) : 1;
 
-      setWorkingPdfBytes(pdfBytes);
+      uploadedRecordToCleanup = null;
+      setOriginalRecord(prepared.originalRecord);
+      setWorkingPdfBytes(prepared.pdfBytes);
       setPdfDocument(loadedPdf);
-      setInspection(preCheckedInspection);
+      setInspection(prepared.inspection);
       setSourceKind(selectedKind);
       setZoom(fitZoom);
       setJumpPageInput('1');
-      setCopyPageInput(preCheckedInspection.pageCount > 1 ? '2' : '1');
+      setCopyPageInput(prepared.inspection.pageCount > 1 ? '2' : '1');
       setPlacements([defaultPlacement]);
       setSelectedPlacementId(defaultPlacement.id);
       setTurnstileResetKey((k) => k + 1);
     } catch (err) {
+      if (uploadedRecordToCleanup) {
+        void deleteUploadedItem(uploadedRecordToCleanup.id, uploadedRecordToCleanup.deleteToken).catch(() => {});
+      }
       setError(err instanceof Error ? err.message : 'Unable to open document in PDF editor.');
       setTurnstileResetKey((k) => k + 1);
     } finally {
@@ -402,76 +362,38 @@ export function DocumentQrEditor() {
   };
 
   const handleGenerateAndSave = async () => {
-    if (!workingPdfBytes || !originalRecord || !selectedFile || placements.length === 0) return;
+    if (
+      !workingPdfBytes ||
+      !originalRecord ||
+      !selectedFile ||
+      placements.length === 0 ||
+      deletedMessage
+    ) {
+      return;
+    }
 
     setError(null);
-    setDeletedMessage(null);
     setGenerating(true);
-    setSaveProgress(0);
 
     try {
-      // 1. Use pre-reserved short ID from upload (or allocate a fresh one on re-generate)
-      const hasValidPreReserved =
-        pendingReservation && pendingReservation.expiresAt > Date.now() + 30_000;
-      const reserved = hasValidPreReserved
-        ? pendingReservation
-        : await reserveShortId({
-            sourceId: originalRecord.id,
-            deleteToken: originalRecord.deleteToken,
-            turnstileToken,
-          });
-      if (hasValidPreReserved) {
-        setPendingReservation(null);
-      }
-
-      // 2. Build & jsQR-verify high-res QR code with 4-module white panel
-      const verifiedQr = generateVerifiedQr({
-        shortUrl: reserved.shortUrl,
-        sizePx: 1000,
-        errorCorrection: 'M',
-        fgColor: '#0A1832',
-        bgColor: '#FFFFFF',
-        safeMargin: true,
-      });
-
-      if (!verifiedQr.verified) {
-        throw new Error('QR scan self-check failed. Please try again.');
-      }
-
-      // 3. Embed QR once into PDF using exact rotation/CropBox/UserUnit transform
-      const qrPngBytes = dataUrlToUint8Array(verifiedQr.pngDataUrl);
-      const outputPdfBytes = await embedQrIntoPdf({
-        pdfBytes: workingPdfBytes,
-        qrPngBytes,
+      const generated = await generateDocumentWithOriginalQr({
+        workingPdfBytes,
+        originalRecord,
+        originalFilename: selectedFile.name,
         placements,
       });
 
-      const outFilename = buildOutputPdfName(selectedFile.name);
-      const outBuffer = new ArrayBuffer(outputPdfBytes.byteLength);
-      new Uint8Array(outBuffer).set(outputPdfBytes);
-      const outFile = new File([outBuffer], outFilename, { type: 'application/pdf' });
-
-      if (outFile.size > EDITABLE_DOC_RULES.maxBytes) {
-        throw new Error(`Finished PDF exceeds the ${EDITABLE_DOC_RULES.maxLabel} upload limit.`);
-      }
-
-      // 4. Upload finished PDF under the reserved short ID (original uploaded file stays intact)
-      const saved = await uploadFileWithProgress({
-        file: outFile,
-        category: 'document',
-        turnstileToken: '',
-        reserved: { id: reserved.id, reserveToken: reserved.reserveToken },
-        onProgress: setSaveProgress,
-      });
+      const outBuffer = new ArrayBuffer(generated.outputPdfBytes.byteLength);
+      new Uint8Array(outBuffer).set(generated.outputPdfBytes);
 
       const blobUrl = URL.createObjectURL(new Blob([outBuffer], { type: 'application/pdf' }));
       if (finalPdfUrl) URL.revokeObjectURL(finalPdfUrl);
 
-      setGeneratedQrDataUrl(verifiedQr.pngDataUrl);
+      setGeneratedQrDataUrl(generated.qrPngDataUrl);
       setFinalPdfUrl(blobUrl);
-      setFinalPdfFilename(outFilename);
-      setFinalRecord(saved);
-      triggerBlobDownload(blobUrl, outFilename);
+      setFinalPdfFilename(generated.outputFilename);
+      setSavedPdfReady(true);
+      triggerBlobDownload(blobUrl, generated.outputFilename);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to embed QR code into PDF.');
     } finally {
@@ -494,16 +416,18 @@ export function DocumentQrEditor() {
     }
   };
 
-  const handleDeleteFinal = async () => {
-    if (!finalRecord) return;
-    setDeletingFinal(true);
+  const handleDeleteOriginal = async () => {
+    if (!originalRecord) return;
+    setDeletingOriginal(true);
     try {
-      await deleteUploadedItem(finalRecord.id, finalRecord.deleteToken);
-      setDeletedMessage('Final PDF removed from server. Scanning its QR code will no longer open it.');
+      await deleteUploadedItem(originalRecord.id, originalRecord.deleteToken);
+      setDeletedMessage(
+        'Original file removed from server. Scanning the QR code in your PDF will no longer open it.'
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not delete file.');
     } finally {
-      setDeletingFinal(false);
+      setDeletingOriginal(false);
     }
   };
 
@@ -864,7 +788,7 @@ export function DocumentQrEditor() {
               placements={placements.filter((p) => p.pageIndex === pageGeom.pageIndex)}
               selectedPlacementId={selectedPlacementId}
               generatedQrDataUrl={generatedQrDataUrl}
-              disabled={Boolean(finalRecord)}
+              disabled={savedPdfReady}
               onSelectPlacement={setSelectedPlacementId}
               onUpdatePlacement={handleUpdatePlacement}
               onLiveSizeChange={handleLiveSizeChange}
@@ -880,8 +804,8 @@ export function DocumentQrEditor() {
               <span>QR Placement</span>
             </h3>
             <p className="text-xs text-slate-500 mt-1">
-              {finalRecord
-                ? 'Real QR code embedded in the PDF below.'
+              {savedPdfReady
+                ? 'Real QR code embedded in the PDF below (opens your original uploaded file).'
                 : 'Drag the preview box and resize from any corner (square-locked, min 2.5 cm).'}
             </p>
           </div>
@@ -908,7 +832,7 @@ export function DocumentQrEditor() {
           )}
 
           {/* Copy to Page N & Placed List */}
-          {!finalRecord && (
+          {!savedPdfReady && (
             <div className="space-y-3 border-t border-slate-100 pt-4">
               {inspection!.pageCount > 1 && (
                 <div className="space-y-2">
@@ -1007,28 +931,13 @@ export function DocumentQrEditor() {
             </div>
           )}
 
-          {generating && (
-            <div className="space-y-1.5">
-              <div className="flex justify-between text-xs font-semibold text-[#0A1832]">
-                <span>Saving final PDF...</span>
-                <span>{saveProgress}%</span>
-              </div>
-              <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-[#D9A441] transition-all duration-150"
-                  style={{ width: `${saveProgress}%` }}
-                />
-              </div>
-            </div>
-          )}
-
-          {!finalRecord ? (
+          {!savedPdfReady ? (
             <button
               type="button"
-              disabled={generating || placements.length === 0}
+              disabled={generating || placements.length === 0 || Boolean(deletedMessage)}
               onClick={handleGenerateAndSave}
               className={`w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition ${
-                !generating && placements.length > 0
+                !generating && placements.length > 0 && !deletedMessage
                   ? 'bg-[#0A1832] hover:bg-[#13294B] text-white cursor-pointer shadow-sm'
                   : 'bg-slate-400 text-white cursor-not-allowed'
               }`}
@@ -1052,7 +961,7 @@ export function DocumentQrEditor() {
                 <span>QR embedded &amp; verified! Ready to download.</span>
               </div>
 
-              {finalPdfUrl && (
+              {finalPdfUrl && !deletedMessage && (
                 <button
                   type="button"
                   onClick={() => triggerBlobDownload(finalPdfUrl, finalPdfFilename)}
@@ -1067,23 +976,23 @@ export function DocumentQrEditor() {
                 <input
                   type="text"
                   readOnly
-                  value={finalRecord.shortUrl}
-                  aria-label="Final PDF short link"
+                  value={originalRecord!.shortUrl}
+                  aria-label="Original uploaded file short link"
                   className="flex-1 bg-transparent text-xs font-mono text-[#0A1832] focus:outline-none truncate px-1"
                 />
                 <button
                   type="button"
-                  onClick={() => handleCopy(finalRecord.shortUrl, 'link')}
+                  onClick={() => handleCopy(originalRecord!.shortUrl, 'link')}
                   className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 hover:border-[#0A1832] text-xs font-semibold text-[#0A1832] cursor-pointer shrink-0"
                 >
                   {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                   {copiedLink ? 'Copied' : 'Copy'}
                 </button>
                 <a
-                  href={finalRecord.shortUrl}
+                  href={originalRecord!.shortUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  title="Open final PDF short link"
+                  title="Open original uploaded file short link"
                   className="p-1.5 rounded-lg bg-white border border-slate-200 hover:border-[#0A1832] text-slate-600 hover:text-[#0A1832] shrink-0"
                 >
                   <ExternalLink className="w-3.5 h-3.5" />
@@ -1091,58 +1000,75 @@ export function DocumentQrEditor() {
               </div>
 
               <div className="text-[11px] text-slate-500">
-                QR inside this PDF opens <strong className="text-[#0A1832]">{finalRecord.shortUrl}</strong>.
-                Original file preserved at <span className="font-mono">{originalRecord!.id}</span>.
+                QR inside this PDF opens your original uploaded file at{' '}
+                <strong className="text-[#0A1832]">{originalRecord!.shortUrl}</strong> (without any QR
+                code inside it).
               </div>
 
               {deletedMessage ? (
-                <div className="text-xs bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl p-3">
-                  {deletedMessage}
-                </div>
-              ) : (
-                <div className="border border-slate-200 rounded-xl p-3 bg-slate-50/70 space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-semibold text-slate-600">
-                      Final PDF Delete Token:
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => handleCopy(finalRecord.deleteToken, 'token')}
-                      className="text-[11px] font-semibold text-[#0A1832] hover:text-[#D9A441] inline-flex items-center gap-1 cursor-pointer"
-                    >
-                      {copiedToken ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
-                      {copiedToken ? 'Token Copied' : 'Copy Token'}
-                    </button>
-                  </div>
-                  <div className="text-[11px] font-mono text-slate-500 truncate bg-white px-2 py-1 rounded border border-slate-200">
-                    {finalRecord.deleteToken}
+                <div className="space-y-2">
+                  <div className="text-xs bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl p-3">
+                    {deletedMessage}
                   </div>
                   <button
                     type="button"
-                    disabled={deletingFinal}
-                    onClick={handleDeleteFinal}
-                    className="w-full py-1.5 px-3 rounded-lg border border-rose-200 text-rose-700 hover:bg-rose-50 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                    onClick={() => {
+                      resetEditorSession();
+                      setSelectedFile(null);
+                      setSelectedKind(null);
+                    }}
+                    className="w-full py-2 px-3 rounded-xl border border-slate-200 hover:border-[#0A1832] text-xs font-bold text-slate-600 hover:text-[#0A1832] flex items-center justify-center gap-1.5 transition cursor-pointer"
                   >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    {deletingFinal ? 'Deleting...' : 'Delete Final PDF from Server'}
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>Upload Another Document</span>
                   </button>
                 </div>
-              )}
+              ) : (
+                <>
+                  <div className="border border-slate-200 rounded-xl p-3 bg-slate-50/70 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold text-slate-600">
+                        Uploaded File Delete Token:
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleCopy(originalRecord!.deleteToken, 'token')}
+                        className="text-[11px] font-semibold text-[#0A1832] hover:text-[#D9A441] inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        {copiedToken ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                        {copiedToken ? 'Token Copied' : 'Copy Token'}
+                      </button>
+                    </div>
+                    <div className="text-[11px] font-mono text-slate-500 truncate bg-white px-2 py-1 rounded border border-slate-200">
+                      {originalRecord!.deleteToken}
+                    </div>
+                    <button
+                      type="button"
+                      disabled={deletingOriginal}
+                      onClick={handleDeleteOriginal}
+                      className="w-full py-1.5 px-3 rounded-lg border border-rose-200 text-rose-700 hover:bg-rose-50 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      {deletingOriginal ? 'Deleting...' : 'Delete Uploaded File from Server'}
+                    </button>
+                  </div>
 
-              <button
-                type="button"
-                onClick={() => {
-                  if (finalPdfUrl) URL.revokeObjectURL(finalPdfUrl);
-                  setFinalPdfUrl(null);
-                  setFinalRecord(null);
-                  setGeneratedQrDataUrl(null);
-                  setDeletedMessage(null);
-                }}
-                className="w-full py-2 px-3 rounded-xl border border-slate-200 hover:border-[#0A1832] text-xs font-bold text-slate-600 hover:text-[#0A1832] flex items-center justify-center gap-1.5 transition cursor-pointer"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Adjust Placement &amp; Generate New Version</span>
-              </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (finalPdfUrl) URL.revokeObjectURL(finalPdfUrl);
+                      setFinalPdfUrl(null);
+                      setSavedPdfReady(false);
+                      setGeneratedQrDataUrl(null);
+                      setDeletedMessage(null);
+                    }}
+                    className="w-full py-2 px-3 rounded-xl border border-slate-200 hover:border-[#0A1832] text-xs font-bold text-slate-600 hover:text-[#0A1832] flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Adjust Placement &amp; Generate New Version</span>
+                  </button>
+                </>
+              )}
             </div>
           )}
         </aside>

@@ -1243,4 +1243,183 @@ describe('Public API & Security Verification (Part D7)', () => {
     expect(fin.id).toBe(orig.nextReservation!.id);
     expect(fin.nextReservation).toBeUndefined();
   });
+
+  it('keeps stored original PDF byte-exact at /f/:id and supports single-use Word conversion upload tickets with Turnstile', async () => {
+    const app = createApp();
+    const env = createTestEnv({
+      TURNSTILE_SECRET_KEY: 'turnstile-test-secret',
+      WORD_CONVERTER_URL: 'https://converter.example.test',
+      WORD_CONVERTER_SECRET: 'conv-secret',
+    });
+
+    // 1. Original PDF uploaded via single-use Turnstile token is served byte-exact at /f/:id
+    const originalPdfBytes = ENC.encode('%PDF-1.7\n1 0 obj\n<< /Title (Clean Original) >>\nendobj\n%%EOF');
+    const convertedPdfBytes = ENC.encode('%PDF-1.7\n1 0 obj\n<< /Title (Converted Clean PDF) >>\nendobj\n%%EOF');
+    const docxBytes = makeFakeOoxmlBytes('word/');
+    const spentTokens = new Set<string>();
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === 'https://challenges.cloudflare.com/turnstile/v0/siteverify') {
+        const params = new URLSearchParams(String(init?.body ?? ''));
+        const token = params.get('response') ?? '';
+        if (!token || spentTokens.has(token)) {
+          return new Response(JSON.stringify({ success: false, 'error-codes': ['timeout-or-duplicate'] }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        spentTokens.add(token);
+        return new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url === 'https://converter.example.test/convert') {
+        return new Response(convertedPdfBytes, {
+          status: 200,
+          headers: { 'Content-Type': 'application/pdf' },
+        });
+      }
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    });
+
+    try {
+      const pdfUploadRes = await app.request(
+        'https://worker.local/api/upload',
+        {
+          method: 'POST',
+          headers: {
+            Origin: ORIGIN,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(originalPdfBytes.byteLength),
+            'X-File-Name': 'report.pdf',
+            'X-File-Category': 'document',
+            'X-Turnstile-Token': 'turnstile-pdf-token-1',
+            'CF-Connecting-IP': '198.51.100.44',
+          },
+          body: originalPdfBytes,
+        },
+        env
+      );
+      expect(pdfUploadRes.status).toBe(201);
+      const pdfRec = (await pdfUploadRes.json()) as { id: string; shortUrl: string };
+
+      const fetchedOrig = await app.request(`https://worker.local/f/${pdfRec.id}`, {}, env);
+      expect(fetchedOrig.status).toBe(200);
+      expect(new Uint8Array(await fetchedOrig.arrayBuffer())).toEqual(originalPdfBytes);
+
+      // 2. Word flow: /api/convert-word consumes Turnstile token once and issues X-Converted-Upload-Ticket
+      const convRes = await app.request(
+        'https://worker.local/api/convert-word',
+        {
+          method: 'POST',
+          headers: {
+            Origin: ORIGIN,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(docxBytes.byteLength),
+            'X-File-Name': 'letter.docx',
+            'X-Turnstile-Token': 'turnstile-word-token-1',
+            'CF-Connecting-IP': '198.51.100.44',
+          },
+          body: docxBytes,
+        },
+        env
+      );
+      expect(convRes.status).toBe(200);
+      expect(convRes.headers.get('Access-Control-Expose-Headers')).toContain('X-Converted-Upload-Ticket');
+      const ticket = convRes.headers.get('X-Converted-Upload-Ticket');
+      expect(ticket).toBeTruthy();
+      expect(new Uint8Array(await convRes.arrayBuffer())).toEqual(convertedPdfBytes);
+
+      // Reusing the already-spent Turnstile token without the ticket fails
+      const reusedTurnstileUpload = await app.request(
+        'https://worker.local/api/upload',
+        {
+          method: 'POST',
+          headers: {
+            Origin: ORIGIN,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(convertedPdfBytes.byteLength),
+            'X-File-Name': 'letter.pdf',
+            'X-File-Category': 'document',
+            'X-Turnstile-Token': 'turnstile-word-token-1',
+            'CF-Connecting-IP': '198.51.100.44',
+          },
+          body: convertedPdfBytes,
+        },
+        env
+      );
+      expect(reusedTurnstileUpload.status).toBe(403);
+
+      // Wrong IP or wrong size cannot use the conversion ticket
+      const wrongIpRes = await app.request(
+        'https://worker.local/api/upload',
+        {
+          method: 'POST',
+          headers: {
+            Origin: ORIGIN,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(convertedPdfBytes.byteLength),
+            'X-File-Name': 'letter.pdf',
+            'X-File-Category': 'document',
+            'X-Converted-Upload-Ticket': ticket!,
+            'CF-Connecting-IP': '203.0.113.99',
+          },
+          body: convertedPdfBytes,
+        },
+        env
+      );
+      expect(wrongIpRes.status).toBe(403);
+
+      // Valid ticket from same IP stores converted PDF cleanly
+      const convUploadRes = await app.request(
+        'https://worker.local/api/upload',
+        {
+          method: 'POST',
+          headers: {
+            Origin: ORIGIN,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(convertedPdfBytes.byteLength),
+            'X-File-Name': 'letter.pdf',
+            'X-File-Category': 'document',
+            'X-Converted-Upload-Ticket': ticket!,
+            'CF-Connecting-IP': '198.51.100.44',
+          },
+          body: convertedPdfBytes,
+        },
+        env
+      );
+      expect(convUploadRes.status).toBe(201);
+      const convRec = (await convUploadRes.json()) as { id: string; mimeType: string };
+      expect(convRec.mimeType).toBe('application/pdf');
+
+      const fetchedConv = await app.request(`https://worker.local/f/${convRec.id}`, {}, env);
+      expect(fetchedConv.status).toBe(200);
+      expect(fetchedConv.headers.get('Content-Type')).toBe('application/pdf');
+      expect(new Uint8Array(await fetchedConv.arrayBuffer())).toEqual(convertedPdfBytes);
+
+      // Replaying the same conversion ticket is rejected
+      const replayRes = await app.request(
+        'https://worker.local/api/upload',
+        {
+          method: 'POST',
+          headers: {
+            Origin: ORIGIN,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(convertedPdfBytes.byteLength),
+            'X-File-Name': 'letter.pdf',
+            'X-File-Category': 'document',
+            'X-Converted-Upload-Ticket': ticket!,
+            'CF-Connecting-IP': '198.51.100.44',
+          },
+          body: convertedPdfBytes,
+        },
+        env
+      );
+      expect(replayRes.status).toBe(403);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
 });

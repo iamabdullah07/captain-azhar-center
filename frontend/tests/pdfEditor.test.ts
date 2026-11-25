@@ -359,11 +359,11 @@ describe('PDF Editor Geometry, Coordinates, Security & Deduplication', () => {
     expect(cssW * scale * (cssH * scale)).toBeLessThanOrEqual(MAX_CANVAS_AREA_PX + 100);
   });
 
-  it('verifies generated QR PNG embedded into PDF decodes back to the reserved short URL', async () => {
-    const reservedShortUrl = 'https://captain-azhar-center.kashaf-hub.workers.dev/f/Reserve99';
-    const qr = makeSampleQrPng(reservedShortUrl);
+  it('verifies generated QR PNG embedded into PDF decodes back to the original short URL', async () => {
+    const originalShortUrl = 'https://captain-azhar-center.kashaf-hub.workers.dev/f/OrigUrl99';
+    const qr = makeSampleQrPng(originalShortUrl);
     const decoded = jsQR(qr.rgba, qr.width, qr.height, { inversionAttempts: 'dontInvert' });
-    expect(decoded?.data).toBe(reservedShortUrl);
+    expect(decoded?.data).toBe(originalShortUrl);
 
     const doc = await PDFDocument.create();
     doc.addPage([595.28, 841.89]);
@@ -380,5 +380,55 @@ describe('PDF Editor Geometry, Coordinates, Security & Deduplication', () => {
       }
     }
     expect(embeddedStream).not.toBeNull();
+  });
+
+  it('keeps original PDF bytes clean (no QR) when embedding QR and when regenerating a new version', async () => {
+    const originalShortUrl = 'https://captain-azhar-center.kashaf-hub.workers.dev/f/OrigDoc01';
+    const qr = makeSampleQrPng(originalShortUrl);
+    const decoded = jsQR(qr.rgba, qr.width, qr.height, { inversionAttempts: 'dontInvert' });
+    expect(decoded?.data).toBe(originalShortUrl);
+
+    const doc = await PDFDocument.create();
+    doc.addPage([595.28, 841.89]);
+    const originalPdfBytes = new Uint8Array(await doc.save());
+    const originalSnapshot = originalPdfBytes.slice();
+
+    const inspection = await inspectPdfForEditing(originalPdfBytes);
+    const p1 = createDefaultPage1Placement(inspection.pages[0], 'v1');
+    const v1Bytes = await embedQrIntoPdf({
+      pdfBytes: originalPdfBytes,
+      qrPngBytes: qr.pngBytes,
+      placements: [p1],
+    });
+
+    // Re-generating from originalPdfBytes at a moved placement must never retain v1's QR
+    const movedPlacement: PdfPlacement = {
+      ...p1,
+      id: 'v2',
+      x: 0.1,
+      y: 0.1,
+    };
+    const v2Bytes = await embedQrIntoPdf({
+      pdfBytes: originalPdfBytes,
+      qrPngBytes: qr.pngBytes,
+      placements: [movedPlacement],
+    });
+
+    expect(originalPdfBytes).toEqual(originalSnapshot);
+
+    const countImages = async (bytes: Uint8Array) => {
+      const parsed = await PDFDocument.load(bytes);
+      let count = 0;
+      for (const [, obj] of parsed.context.enumerateIndirectObjects()) {
+        if (obj instanceof PDFStream && obj.dict.lookup(PDFName.of('Subtype')) === PDFName.of('Image')) {
+          count++;
+        }
+      }
+      return count;
+    };
+
+    expect(await countImages(originalPdfBytes)).toBe(0);
+    expect(await countImages(v1Bytes)).toBe(1);
+    expect(await countImages(v2Bytes)).toBe(1);
   });
 });
