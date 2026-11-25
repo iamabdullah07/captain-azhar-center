@@ -32,7 +32,6 @@ import {
   formatElapsedTimer,
   formatRowCopyText,
   getShortModelBadge,
-  ID_TYPE_LABELS,
   loadExtractModelPrefs,
   saveExtractModelPrefs,
   type ExtractTableRow,
@@ -1159,19 +1158,12 @@ export function AllFilesDataSection() {
                             )}
                           </div>
 
-                          {(row.idType || isDuplicateId) && (
+                          {isDuplicateId && (
                             <div className="flex items-center gap-1 flex-wrap">
-                              {row.idType && (
-                                <span className="text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
-                                  {ID_TYPE_LABELS[row.idType]}
-                                </span>
-                              )}
-                              {isDuplicateId && (
-                                <span className="inline-flex items-center gap-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
-                                  <AlertTriangle className="w-2.5 h-2.5" />
-                                  Duplicate ID
-                                </span>
-                              )}
+                              <span className="inline-flex items-center gap-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                                <AlertTriangle className="w-2.5 h-2.5" />
+                                Duplicate ID
+                              </span>
                             </div>
                           )}
                         </div>
