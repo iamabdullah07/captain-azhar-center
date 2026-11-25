@@ -532,6 +532,7 @@ export function createPublicRoutes() {
   app.get('/f/:id', async (c) => {
     const id = c.req.param('id').trim();
     const rangeHeader = c.req.header('Range') ?? null;
+    const canonicalCacheUrl = new URL(`/f/${id}`, c.req.url).toString();
 
     // Edge cache check (skip for Range requests so partial video chunks work accurately)
     const cache = typeof caches !== 'undefined'
@@ -539,7 +540,7 @@ export function createPublicRoutes() {
       : null;
 
     if (cache && !rangeHeader) {
-      const cached = await cache.match(c.req.url);
+      const cached = await cache.match(canonicalCacheUrl);
       if (cached) return cached;
     }
 
@@ -560,7 +561,8 @@ export function createPublicRoutes() {
           appName,
           homeUrl,
         }),
-        404
+        404,
+        { 'Cache-Control': 'no-store' }
       );
     }
 
@@ -576,7 +578,8 @@ export function createPublicRoutes() {
           appName,
           homeUrl,
         }),
-        410
+        410,
+        { 'Cache-Control': 'no-store' }
       );
     }
 
@@ -589,7 +592,8 @@ export function createPublicRoutes() {
           appName,
           homeUrl,
         }),
-        451
+        451,
+        { 'Cache-Control': 'no-store' }
       );
     }
 
@@ -601,12 +605,12 @@ export function createPublicRoutes() {
         status: 302,
         headers: {
           Location: row.target_url,
-          'Cache-Control': 'public, max-age=300',
+          'Cache-Control': 'public, max-age=0, s-maxage=300, must-revalidate',
           'X-Content-Type-Options': 'nosniff',
         },
       });
       if (cache) {
-        runInBackground(c, cache.put(c.req.url, response.clone()));
+        runInBackground(c, cache.put(canonicalCacheUrl, response.clone()));
       }
       return response;
     }
@@ -638,7 +642,8 @@ export function createPublicRoutes() {
           appName,
           homeUrl,
         }),
-        410
+        410,
+        { 'Cache-Control': 'no-store' }
       );
     }
 
@@ -653,7 +658,9 @@ export function createPublicRoutes() {
       'Content-Disposition': disposition,
       'Accept-Ranges': 'bytes',
       'Content-Security-Policy': "default-src 'none'; media-src 'self'; img-src 'self'; sandbox",
-      'Cache-Control': 'public, max-age=3600',
+      'Cache-Control': 'public, max-age=0, s-maxage=3600, must-revalidate',
+      ETag: `"${row.id}-${row.created_at}"`,
+      Vary: 'Range',
     });
 
     if (parsedRange) {
@@ -667,7 +674,7 @@ export function createPublicRoutes() {
 
     // Edge cache files under 15 MB to reduce R2 read counts on heavily scanned QRs
     if (cache && row.size_bytes <= 15 * 1024 * 1024) {
-      runInBackground(c, cache.put(c.req.url, response.clone()));
+      runInBackground(c, cache.put(canonicalCacheUrl, response.clone()));
     }
 
     return response;

@@ -138,6 +138,66 @@ describe('Public API & Security Verification (Part D7)', () => {
     expect(afterDel.status).toBe(410);
   });
 
+  it('stores two distinct uploaded images under unique IDs/R2 keys and returns distinct content per link', async () => {
+    const app = createApp();
+    const env = createTestEnv();
+
+    const imgA = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 1, 1, 1, 11]);
+    const imgB = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 2, 2, 2, 2, 22, 33]);
+
+    const resA = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(imgA.byteLength),
+          'X-File-Name': 'first-photo.png',
+          'X-File-Category': 'image',
+        },
+        body: imgA,
+      },
+      env
+    );
+    expect(resA.status).toBe(201);
+    const dataA = (await resA.json()) as { id: string; shortUrl: string };
+
+    const resB = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(imgB.byteLength),
+          'X-File-Name': 'second-photo.png',
+          'X-File-Category': 'image',
+        },
+        body: imgB,
+      },
+      env
+    );
+    expect(resB.status).toBe(201);
+    const dataB = (await resB.json()) as { id: string; shortUrl: string };
+
+    expect(dataA.id).not.toBe(dataB.id);
+    expect(dataA.shortUrl).not.toBe(dataB.shortUrl);
+    expect(env.FILES.store.size).toBe(2);
+
+    const getA = await app.request(`https://worker.local/f/${dataA.id}`, {}, env);
+    const getB = await app.request(`https://worker.local/f/${dataB.id}`, {}, env);
+    expect(getA.status).toBe(200);
+    expect(getB.status).toBe(200);
+    expect(getA.headers.get('Cache-Control')).toContain('must-revalidate');
+    expect(getA.headers.get('Vary')).toBe('Range');
+    expect(getA.headers.get('ETag')).not.toBe(getB.headers.get('ETag'));
+
+    const bytesA = new Uint8Array(await getA.arrayBuffer());
+    const bytesB = new Uint8Array(await getB.arrayBuffer());
+    expect(bytesA).toEqual(imgA);
+    expect(bytesB).toEqual(imgB);
+    expect(bytesA).not.toEqual(bytesB);
+  });
+
   it('enforces single-owner signup lock, admin auth, rate limit, and CSRF protection', async () => {
     const app = createApp();
     const env = createTestEnv();

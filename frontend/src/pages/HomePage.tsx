@@ -112,6 +112,9 @@ export function HomePage() {
   const handleTabChange = (tab: InputTab) => {
     setActiveTab(tab);
     setSelectedFile(null);
+    setRecord(null);
+    setAssets(null);
+    setDeletedMessage(null);
     setError(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -120,6 +123,9 @@ export function HomePage() {
 
   const handleFilePicked = (file: File | undefined) => {
     if (!file || activeTab === 'link') return;
+    setRecord(null);
+    setAssets(null);
+    setDeletedMessage(null);
     const check = validateSelectedFile(file, activeTab);
     if (!check.ok) {
       setSelectedFile(null);
@@ -171,6 +177,8 @@ export function HomePage() {
       }
     }
 
+    setRecord(null);
+    setAssets(null);
     setLoading(true);
     setProgress(0);
 
@@ -305,7 +313,14 @@ export function HomePage() {
                   <input
                     type="url"
                     value={urlInput}
-                    onChange={(e) => setUrlInput(e.target.value)}
+                    onChange={(e) => {
+                      setUrlInput(e.target.value);
+                      if (record) {
+                        setRecord(null);
+                        setAssets(null);
+                        setDeletedMessage(null);
+                      }
+                    }}
                     placeholder="https://example.com/your-page"
                     className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#0A1832] focus:ring-2 focus:ring-[#D9A441]/30 outline-none text-sm text-[#0A1832]"
                   />
@@ -320,7 +335,11 @@ export function HomePage() {
                     ref={fileInputRef}
                     type="file"
                     accept={UPLOAD_RULES[activeTab].accept}
-                    onChange={(e) => handleFilePicked(e.target.files?.[0])}
+                    onChange={(e) => {
+                      const picked = e.target.files?.[0];
+                      e.target.value = '';
+                      handleFilePicked(picked);
+                    }}
                     className="hidden"
                   />
 
@@ -365,6 +384,9 @@ export function HomePage() {
                           onClick={(e) => {
                             e.stopPropagation();
                             setSelectedFile(null);
+                            setRecord(null);
+                            setAssets(null);
+                            setDeletedMessage(null);
                             if (fileInputRef.current) fileInputRef.current.value = '';
                           }}
                           aria-label="Remove selected file"

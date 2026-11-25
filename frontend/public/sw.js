@@ -1,4 +1,4 @@
-const CACHE_NAME = 'captain-azhar-qr-v1';
+const CACHE_NAME = 'captain-azhar-qr-v2';
 const SHELL_ASSETS = ['./', './index.html', './manifest.webmanifest', './logo.png', './favicon.png'];
 
 self.addEventListener('install', (event) => {
@@ -22,7 +22,7 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
-  if (url.pathname.includes('/api/') || url.pathname.startsWith('/f/')) return;
+  if (url.pathname.includes('/api/') || url.pathname.includes('/f/')) return;
 
   event.respondWith(
     fetch(req)

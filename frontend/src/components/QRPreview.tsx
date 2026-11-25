@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import {
   AlertCircle,
   Check,
@@ -56,6 +56,13 @@ export function QRPreview({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [previewMode, setPreviewMode] = useState<'normal' | 'transparent'>('normal');
 
+  useEffect(() => {
+    setPreviewMode('normal');
+    setConfirmDelete(false);
+    setCopiedLink(false);
+    setCopiedToken(false);
+  }, [record?.id]);
+
   const handleCopy = async (text: string, which: 'link' | 'token') => {
     try {
       await navigator.clipboard.writeText(text);
@@ -72,10 +79,10 @@ export function QRPreview({
   };
 
   const handleDownloadSvg = () => {
-    if (!assets) return;
+    if (!assets || !record) return;
     const blob = new Blob([assets.svgString], { type: 'image/svg+xml;charset=utf-8' });
     const url = URL.createObjectURL(blob);
-    triggerDownload(url, `captain-azhar-qr-${assets.sizePx}px.svg`);
+    triggerDownload(url, `captain-azhar-qr-${record.id}-${assets.sizePx}px.svg`);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
@@ -153,6 +160,7 @@ export function QRPreview({
             </div>
           ) : assets ? (
             <img
+              key={`${record?.id ?? 'qr'}-${previewMode}`}
               src={isTransparentPreview ? assets.transparentPngDataUrl : assets.pngDataUrl}
               alt={isTransparentPreview ? 'Transparent QR Code Preview' : 'Generated QR Code'}
               className="w-full h-full object-contain"
@@ -179,6 +187,14 @@ export function QRPreview({
           )}
 
           {/* Short URL + Copy */}
+          <div className="text-[11px] font-medium text-slate-600 bg-amber-50/60 border border-amber-200/80 rounded-xl px-3 py-2 truncate">
+            Active QR target:{' '}
+            <strong className="text-[#0A1832]">
+              {record.originalName || record.targetUrl || record.id}
+            </strong>{' '}
+            <span className="font-mono text-slate-500">({record.id})</span>
+          </div>
+
           <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 flex items-center gap-2">
             <input
               type="text"
@@ -212,7 +228,10 @@ export function QRPreview({
               <button
                 type="button"
                 onClick={() =>
-                  triggerDownload(assets.pngDataUrl, `captain-azhar-qr-${assets.sizePx}px.png`)
+                  triggerDownload(
+                    assets.pngDataUrl,
+                    `captain-azhar-qr-${record.id}-${assets.sizePx}px.png`
+                  )
                 }
                 title={`Download PNG (${assets.sizePx} × ${assets.sizePx} px)`}
                 className="py-2.5 px-2 rounded-xl bg-[#0A1832] hover:bg-[#13294B] border border-[#0A1832] text-white text-xs font-bold flex items-center justify-center gap-1 transition cursor-pointer shadow-xs"
@@ -232,7 +251,10 @@ export function QRPreview({
               <button
                 type="button"
                 onClick={() =>
-                  triggerDownload(assets.jpgDataUrl, `captain-azhar-qr-${assets.sizePx}px.jpg`)
+                  triggerDownload(
+                    assets.jpgDataUrl,
+                    `captain-azhar-qr-${record.id}-${assets.sizePx}px.jpg`
+                  )
                 }
                 title={`Download JPG (${assets.sizePx} × ${assets.sizePx} px)`}
                 className="py-2.5 px-2 rounded-xl border border-slate-200 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] flex items-center justify-center gap-1 transition cursor-pointer"
@@ -242,7 +264,7 @@ export function QRPreview({
               </button>
               <button
                 type="button"
-                onClick={() => downloadQrAsPdf(assets)}
+                onClick={() => downloadQrAsPdf(assets, `captain-azhar-qr-${record.id}`)}
                 title="Download Print PDF"
                 className="py-2.5 px-2 rounded-xl border border-slate-200 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] flex items-center justify-center gap-1 transition cursor-pointer"
               >
@@ -262,6 +284,7 @@ export function QRPreview({
                   className="w-11 h-11 rounded-lg border border-slate-300 p-1 shrink-0 overflow-hidden cursor-pointer hover:border-[#0A1832] transition"
                 >
                   <img
+                    key={`thumb-${record.id}`}
                     src={assets.transparentPngDataUrl}
                     alt="Transparent QR checkerboard thumbnail"
                     className="w-full h-full object-contain"
@@ -273,7 +296,7 @@ export function QRPreview({
                   onClick={() =>
                     triggerDownload(
                       assets.transparentPngDataUrl,
-                      `captain-azhar-qr-transparent-${assets.sizePx}px.png`
+                      `captain-azhar-qr-transparent-${record.id}-${assets.sizePx}px.png`
                     )
                   }
                   className="flex-1 py-2.5 px-3 rounded-xl border border-[#0A1832]/30 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] flex items-center justify-center gap-1.5 transition cursor-pointer"
