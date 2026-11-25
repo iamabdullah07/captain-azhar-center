@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import QRCode from 'qrcode';
 import jsQR from 'jsqr';
-import { evaluateQrContrast } from '../src/lib/qrEngine';
+import {
+  buildMatrixGrid,
+  buildQrPixelBuffer,
+  evaluateQrContrast,
+  verifyTransparentBufferOnLightBg,
+} from '../src/lib/qrEngine';
 import { validateSelectedFile, validateUrlInput } from '../src/lib/fileCheck';
 
-describe('QR Contrast & Input Validation', () => {
+describe('QR Contrast, Validation & Transparent PNG Decoding', () => {
   it('blocks low contrast and inverted light-on-dark QR color combinations', () => {
     const good = evaluateQrContrast('#0A1832', '#FFFFFF');
     expect(good.isBlocked).toBe(false);
@@ -34,41 +38,61 @@ describe('QR Contrast & Input Validation', () => {
     expect(validateSelectedFile(validPptx, 'document').ok).toBe(true);
   });
 
-  it('produces pixel-exact QR modules that decode cleanly with jsQR at 200px and 500px', () => {
-    const shortUrl = 'https://captain-azhar.workers.dev/f/AbC123xYz';
-    const qr = QRCode.create(shortUrl, { errorCorrectionLevel: 'M' });
-    const n = qr.modules.size;
-    const quietZone = 4;
-    const total = n + quietZone * 2;
+  it('produces pixel-exact normal QR buffers that decode cleanly with jsQR at 200px and 500px', () => {
+    const shortUrl = 'https://captain-azhar-center.kashaf-hub.workers.dev/f/AbC123xYz';
+    const matrix = buildMatrixGrid(shortUrl, 'M');
 
     for (const targetPx of [200, 500]) {
-      const modPx = Math.max(1, Math.floor(targetPx / total));
-      const drawn = modPx * total;
-      const offset = Math.floor((targetPx - drawn) / 2);
+      const buf = buildQrPixelBuffer({
+        matrix,
+        targetSizePx: targetPx,
+        quietZoneModules: 4,
+        fgColor: '#0A1832',
+        bgColor: '#FFFFFF',
+      });
 
-      const rgba = new Uint8ClampedArray(targetPx * targetPx * 4);
-      rgba.fill(255); // white background
+      expect(buf.width).toBe(targetPx);
+      expect(buf.height).toBe(targetPx);
 
-      for (let r = 0; r < n; r++) {
-        for (let c = 0; c < n; c++) {
-          if (!qr.modules.get(r, c)) continue;
-          const x0 = offset + (c + quietZone) * modPx;
-          const y0 = offset + (r + quietZone) * modPx;
-          for (let dy = 0; dy < modPx; dy++) {
-            for (let dx = 0; dx < modPx; dx++) {
-              const idx = ((y0 + dy) * targetPx + (x0 + dx)) * 4;
-              rgba[idx] = 10;     // #0A1832
-              rgba[idx + 1] = 24;
-              rgba[idx + 2] = 50;
-              rgba[idx + 3] = 255;
-            }
-          }
-        }
-      }
-
-      const decoded = jsQR(rgba, targetPx, targetPx, { inversionAttempts: 'dontInvert' });
+      const decoded = jsQR(buf.data, buf.width, buf.height, { inversionAttempts: 'dontInvert' });
       expect(decoded).not.toBeNull();
       expect(decoded?.data).toBe(shortUrl);
     }
+  });
+
+  it('generates zero-margin transparent QR buffer that decodes cleanly with jsQR on a light background', () => {
+    const shortUrl = 'https://captain-azhar-center.kashaf-hub.workers.dev/f/AbC123xYz';
+    const matrix = buildMatrixGrid(shortUrl, 'M');
+
+    const transBuf = buildQrPixelBuffer({
+      matrix,
+      targetSizePx: 300,
+      quietZoneModules: 0,
+      fgColor: '#0A1832',
+      bgColor: null,
+      tightTransparent: true,
+    });
+
+    // Top-left corner (0,0) is always a dark finder module -> opaque #0A1832
+    expect(transBuf.data[0]).toBe(10);
+    expect(transBuf.data[1]).toBe(24);
+    expect(transBuf.data[2]).toBe(50);
+    expect(transBuf.data[3]).toBe(255);
+
+    // Verify there are truly transparent (alpha=0) pixels in the buffer and no white background pixels
+    let transparentCount = 0;
+    let whiteBgCount = 0;
+    for (let i = 0; i < transBuf.data.length; i += 4) {
+      if (transBuf.data[i + 3] === 0) transparentCount++;
+      if (transBuf.data[i] === 255 && transBuf.data[i + 1] === 255 && transBuf.data[i + 2] === 255) {
+        whiteBgCount++;
+      }
+    }
+    expect(transparentCount).toBeGreaterThan(0);
+    expect(whiteBgCount).toBe(0);
+
+    // Without white padding, raw transparent pixels have R=G=B=0 (cannot scan),
+    // but placed on a light background with quiet margin, jsQR decodes accurately!
+    expect(verifyTransparentBufferOnLightBg(transBuf, shortUrl, 24)).toBe(true);
   });
 });

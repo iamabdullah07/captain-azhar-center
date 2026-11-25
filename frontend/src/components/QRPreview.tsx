@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type CSSProperties } from 'react';
 import {
   AlertCircle,
   Check,
@@ -24,6 +24,14 @@ interface QRPreviewProps {
   deletedMessage: string | null;
 }
 
+const CHECKERBOARD_STYLE: CSSProperties = {
+  backgroundImage:
+    'linear-gradient(45deg, #e2e8f0 25%, transparent 25%), linear-gradient(-45deg, #e2e8f0 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #e2e8f0 75%), linear-gradient(-45deg, transparent 75%, #e2e8f0 75%)',
+  backgroundSize: '16px 16px',
+  backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0',
+  backgroundColor: '#ffffff',
+};
+
 function triggerDownload(url: string, filename: string) {
   const a = document.createElement('a');
   a.href = url;
@@ -46,6 +54,7 @@ export function QRPreview({
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedToken, setCopiedToken] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [previewMode, setPreviewMode] = useState<'normal' | 'transparent'>('normal');
 
   const handleCopy = async (text: string, which: 'link' | 'token') => {
     try {
@@ -70,9 +79,11 @@ export function QRPreview({
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  const isTransparentPreview = Boolean(assets && previewMode === 'transparent');
+
   return (
     <div className="bg-white rounded-2xl border border-slate-200/80 shadow-[0_12px_35px_-12px_rgba(10,24,50,0.08)] p-6">
-      <div className="flex items-center justify-between gap-3 mb-5">
+      <div className="flex items-center justify-between gap-2 mb-4">
         <div className="flex items-center gap-2.5">
           <span className="w-7 h-7 rounded-full bg-[#0A1832] text-white text-xs font-bold flex items-center justify-center">
             3
@@ -88,9 +99,42 @@ export function QRPreview({
         )}
       </div>
 
+      {/* Preview mode toggle when QR is generated */}
+      {assets && !loading && !error && (
+        <div className="grid grid-cols-2 gap-1 bg-slate-100 p-1 rounded-xl mb-3 text-xs font-bold">
+          <button
+            type="button"
+            onClick={() => setPreviewMode('normal')}
+            className={`py-1.5 rounded-lg transition cursor-pointer ${
+              previewMode === 'normal'
+                ? 'bg-white text-[#0A1832] shadow-xs'
+                : 'text-slate-500 hover:text-[#0A1832]'
+            }`}
+          >
+            Standard Preview
+          </button>
+          <button
+            type="button"
+            onClick={() => setPreviewMode('transparent')}
+            className={`py-1.5 rounded-lg transition cursor-pointer ${
+              previewMode === 'transparent'
+                ? 'bg-white text-[#0A1832] shadow-xs'
+                : 'text-slate-500 hover:text-[#0A1832]'
+            }`}
+          >
+            Transparent Preview
+          </button>
+        </div>
+      )}
+
       {/* Warm gold-framed preview box matching reference screenshot */}
       <div className="bg-amber-50/40 border-2 border-amber-100 rounded-2xl p-4">
-        <div className="bg-white rounded-xl border border-slate-100 aspect-square w-full flex flex-col items-center justify-center p-4 overflow-hidden">
+        <div
+          style={isTransparentPreview ? CHECKERBOARD_STYLE : undefined}
+          className={`${
+            isTransparentPreview ? '' : 'bg-white'
+          } rounded-xl border border-slate-100 aspect-square w-full flex flex-col items-center justify-center p-4 overflow-hidden`}
+        >
           {loading ? (
             <div className="flex flex-col items-center text-center gap-3">
               <Loader2 className="w-9 h-9 text-[#D9A441] animate-spin" />
@@ -109,8 +153,8 @@ export function QRPreview({
             </div>
           ) : assets ? (
             <img
-              src={assets.pngDataUrl}
-              alt="Generated QR Code"
+              src={isTransparentPreview ? assets.transparentPngDataUrl : assets.pngDataUrl}
+              alt={isTransparentPreview ? 'Transparent QR Code Preview' : 'Generated QR Code'}
               className="w-full h-full object-contain"
               style={{ imageRendering: 'pixelated' }}
             />
@@ -126,7 +170,7 @@ export function QRPreview({
       </div>
 
       {assets && record && (
-        <div className="mt-4 space-y-4">
+        <div className="mt-4 space-y-3.5">
           {assets.autoAdjusted && (
             <div className="text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-xl px-3 py-2">
               Scan self-check upgraded settings to Error Correction <strong>{assets.effectiveEcl}</strong>
@@ -162,43 +206,86 @@ export function QRPreview({
             </a>
           </div>
 
-          {/* Primary & secondary download buttons */}
-          <div className="space-y-2">
-            <button
-              type="button"
-              onClick={() =>
-                triggerDownload(assets.pngDataUrl, `captain-azhar-qr-${assets.sizePx}px.png`)
-              }
-              className="w-full py-2.5 px-4 rounded-xl bg-[#0A1832] hover:bg-[#13294B] text-white font-bold text-sm flex items-center justify-center gap-2 transition cursor-pointer shadow-sm"
-            >
-              <Download className="w-4 h-4 text-[#D9A441]" />
-              Download PNG ({assets.sizePx} × {assets.sizePx} px)
-            </button>
-
-            <div className="grid grid-cols-3 gap-2">
+          {/* 4 equal-size format buttons in a single row */}
+          <div className="space-y-2.5">
+            <div className="grid grid-cols-4 gap-2">
+              <button
+                type="button"
+                onClick={() =>
+                  triggerDownload(assets.pngDataUrl, `captain-azhar-qr-${assets.sizePx}px.png`)
+                }
+                title={`Download PNG (${assets.sizePx} × ${assets.sizePx} px)`}
+                className="py-2.5 px-2 rounded-xl bg-[#0A1832] hover:bg-[#13294B] border border-[#0A1832] text-white text-xs font-bold flex items-center justify-center gap-1 transition cursor-pointer shadow-xs"
+              >
+                <Download className="w-3.5 h-3.5 text-[#D9A441] shrink-0" />
+                <span>PNG</span>
+              </button>
               <button
                 type="button"
                 onClick={handleDownloadSvg}
-                className="py-2 px-3 rounded-xl border border-slate-200 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] transition cursor-pointer"
+                title="Download Vector SVG"
+                className="py-2.5 px-2 rounded-xl border border-slate-200 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] flex items-center justify-center gap-1 transition cursor-pointer"
               >
-                SVG (Vector)
+                <Download className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                <span>SVG</span>
               </button>
               <button
                 type="button"
                 onClick={() =>
                   triggerDownload(assets.jpgDataUrl, `captain-azhar-qr-${assets.sizePx}px.jpg`)
                 }
-                className="py-2 px-3 rounded-xl border border-slate-200 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] transition cursor-pointer"
+                title={`Download JPG (${assets.sizePx} × ${assets.sizePx} px)`}
+                className="py-2.5 px-2 rounded-xl border border-slate-200 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] flex items-center justify-center gap-1 transition cursor-pointer"
               >
-                JPG
+                <Download className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                <span>JPG</span>
               </button>
               <button
                 type="button"
                 onClick={() => downloadQrAsPdf(assets)}
-                className="py-2 px-3 rounded-xl border border-slate-200 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] transition cursor-pointer"
+                title="Download Print PDF"
+                className="py-2.5 px-2 rounded-xl border border-slate-200 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] flex items-center justify-center gap-1 transition cursor-pointer"
               >
-                PDF
+                <Download className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                <span>PDF</span>
               </button>
+            </div>
+
+            {/* Separate Transparent PNG card with checkerboard thumbnail & light-bg note */}
+            <div className="border border-slate-200 rounded-xl p-3 bg-slate-50/70 space-y-2">
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setPreviewMode('transparent')}
+                  title="Preview Transparent QR on checkerboard"
+                  style={CHECKERBOARD_STYLE}
+                  className="w-11 h-11 rounded-lg border border-slate-300 p-1 shrink-0 overflow-hidden cursor-pointer hover:border-[#0A1832] transition"
+                >
+                  <img
+                    src={assets.transparentPngDataUrl}
+                    alt="Transparent QR checkerboard thumbnail"
+                    className="w-full h-full object-contain"
+                    style={{ imageRendering: 'pixelated' }}
+                  />
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    triggerDownload(
+                      assets.transparentPngDataUrl,
+                      `captain-azhar-qr-transparent-${assets.sizePx}px.png`
+                    )
+                  }
+                  className="flex-1 py-2.5 px-3 rounded-xl border border-[#0A1832]/30 hover:border-[#0A1832] bg-white text-xs font-bold text-[#0A1832] flex items-center justify-center gap-1.5 transition cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5 text-[#D9A441]" />
+                  <span>Transparent PNG</span>
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-500 leading-snug">
+                No background or white margin — place directly on designs. Scans reliably on{' '}
+                <strong className="text-[#0A1832]">light backgrounds only</strong>.
+              </p>
             </div>
           </div>
 

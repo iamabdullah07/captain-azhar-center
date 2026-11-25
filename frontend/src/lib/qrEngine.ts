@@ -119,8 +119,10 @@ export interface GeneratedQrAssets {
   effectiveMargin: boolean;
   autoAdjusted: boolean;
   verified: boolean;
+  transparentVerified: boolean;
   moduleCount: number;
   pngDataUrl: string;
+  transparentPngDataUrl: string;
   jpgDataUrl: string;
   svgString: string;
   matrix: boolean[][];
@@ -128,7 +130,7 @@ export interface GeneratedQrAssets {
   bgColor: string;
 }
 
-function buildMatrixGrid(text: string, ecl: QrErrorCorrection): boolean[][] {
+export function buildMatrixGrid(text: string, ecl: QrErrorCorrection): boolean[][] {
   const qr = QRCode.create(text, { errorCorrectionLevel: ecl });
   const size = qr.modules.size;
   const grid: boolean[][] = [];
@@ -142,41 +144,110 @@ function buildMatrixGrid(text: string, ecl: QrErrorCorrection): boolean[][] {
   return grid;
 }
 
-function renderMatrixToCanvas(params: {
+/**
+ * Pure RGBA pixel buffer generator (works in both browser and Node tests).
+ * When `bgColor` is null, background pixels are fully transparent (alpha = 0).
+ */
+export function buildQrPixelBuffer(params: {
   matrix: boolean[][];
   targetSizePx: number;
   quietZoneModules: number;
   fgColor: string;
-  bgColor: string;
-}): HTMLCanvasElement {
-  const { matrix, targetSizePx, quietZoneModules, fgColor, bgColor } = params;
-  const canvas = document.createElement('canvas');
-  canvas.width = targetSizePx;
-  canvas.height = targetSizePx;
-
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) throw new Error('Canvas 2D context unavailable.');
-
-  ctx.imageSmoothingEnabled = false;
-  ctx.fillStyle = bgColor;
-  ctx.fillRect(0, 0, targetSizePx, targetSizePx);
+  bgColor: string | null;
+  tightTransparent?: boolean;
+}): { width: number; height: number; data: Uint8ClampedArray } {
+  const { matrix, targetSizePx, quietZoneModules, fgColor, bgColor, tightTransparent = false } = params;
+  const fgRgb = parseHexRgb(fgColor) ?? [10, 24, 50];
+  const bgRgb = bgColor ? (parseHexRgb(bgColor) ?? [255, 255, 255]) : null;
 
   const n = matrix.length;
   const totalModules = n + quietZoneModules * 2;
   const modulePx = Math.max(1, Math.floor(targetSizePx / totalModules));
   const drawnSize = modulePx * totalModules;
-  const offset = Math.floor((targetSizePx - drawnSize) / 2);
+  const canvasSize = tightTransparent ? drawnSize : targetSizePx;
+  const offset = tightTransparent ? 0 : Math.floor((canvasSize - drawnSize) / 2);
 
-  ctx.fillStyle = fgColor;
+  const data = new Uint8ClampedArray(canvasSize * canvasSize * 4);
+  if (bgRgb) {
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = bgRgb[0];
+      data[i + 1] = bgRgb[1];
+      data[i + 2] = bgRgb[2];
+      data[i + 3] = 255;
+    }
+  }
+
   for (let r = 0; r < n; r++) {
     for (let c = 0; c < n; c++) {
-      if (matrix[r][c]) {
-        const x = offset + (c + quietZoneModules) * modulePx;
-        const y = offset + (r + quietZoneModules) * modulePx;
-        ctx.fillRect(x, y, modulePx, modulePx);
+      if (!matrix[r][c]) continue;
+      const x0 = offset + (c + quietZoneModules) * modulePx;
+      const y0 = offset + (r + quietZoneModules) * modulePx;
+      for (let dy = 0; dy < modulePx; dy++) {
+        for (let dx = 0; dx < modulePx; dx++) {
+          const idx = ((y0 + dy) * canvasSize + (x0 + dx)) * 4;
+          data[idx] = fgRgb[0];
+          data[idx + 1] = fgRgb[1];
+          data[idx + 2] = fgRgb[2];
+          data[idx + 3] = 255;
+        }
       }
     }
   }
+
+  return { width: canvasSize, height: canvasSize, data };
+}
+
+/**
+ * Composites a transparent QR RGBA buffer onto a white document background with light quiet margin
+ * and runs jsQR decode to confirm it scans cleanly when placed on light documents.
+ */
+export function verifyTransparentBufferOnLightBg(
+  transparentBuf: { width: number; height: number; data: Uint8ClampedArray },
+  expectedText: string,
+  padPx = 24
+): boolean {
+  const outW = transparentBuf.width + padPx * 2;
+  const outH = transparentBuf.height + padPx * 2;
+  const composited = new Uint8ClampedArray(outW * outH * 4);
+  composited.fill(255); // solid white background + alpha 255
+
+  for (let y = 0; y < transparentBuf.height; y++) {
+    for (let x = 0; x < transparentBuf.width; x++) {
+      const srcIdx = (y * transparentBuf.width + x) * 4;
+      const alpha = transparentBuf.data[srcIdx + 3];
+      if (alpha === 0) continue;
+      const dstIdx = ((y + padPx) * outW + (x + padPx)) * 4;
+      const a = alpha / 255;
+      composited[dstIdx] = Math.round(transparentBuf.data[srcIdx] * a + 255 * (1 - a));
+      composited[dstIdx + 1] = Math.round(transparentBuf.data[srcIdx + 1] * a + 255 * (1 - a));
+      composited[dstIdx + 2] = Math.round(transparentBuf.data[srcIdx + 2] * a + 255 * (1 - a));
+      composited[dstIdx + 3] = 255;
+    }
+  }
+
+  const decoded = jsQR(composited, outW, outH, { inversionAttempts: 'dontInvert' });
+  return Boolean(decoded && decoded.data === expectedText);
+}
+
+function renderMatrixToCanvas(params: {
+  matrix: boolean[][];
+  targetSizePx: number;
+  quietZoneModules: number;
+  fgColor: string;
+  bgColor: string | null;
+  tightTransparent?: boolean;
+}): HTMLCanvasElement {
+  const buf = buildQrPixelBuffer(params);
+  const canvas = document.createElement('canvas');
+  canvas.width = buf.width;
+  canvas.height = buf.height;
+
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('Canvas 2D context unavailable.');
+
+  ctx.imageSmoothingEnabled = false;
+  const imgData = new ImageData(new Uint8ClampedArray(buf.data), buf.width, buf.height);
+  ctx.putImageData(imgData, 0, 0);
   return canvas;
 }
 
@@ -299,6 +370,32 @@ export function generateVerifiedQr(params: {
 
   const pngDataUrl = chosenCanvas.toDataURL('image/png');
   const jpgDataUrl = chosenCanvas.toDataURL('image/jpeg', 0.96);
+
+  // Transparent PNG: zero white margin, transparent background (only foreground QR dots)
+  const transparentCanvas = renderMatrixToCanvas({
+    matrix: chosenMatrix,
+    targetSizePx: params.sizePx,
+    quietZoneModules: 0,
+    fgColor: params.fgColor,
+    bgColor: null,
+    tightTransparent: true,
+  });
+  const transparentPngDataUrl = transparentCanvas.toDataURL('image/png');
+
+  const transparentCheckBuf = buildQrPixelBuffer({
+    matrix: chosenMatrix,
+    targetSizePx: params.sizePx > 1000 ? 500 : params.sizePx,
+    quietZoneModules: 0,
+    fgColor: params.fgColor,
+    bgColor: null,
+    tightTransparent: true,
+  });
+  const transparentVerified = verifyTransparentBufferOnLightBg(
+    transparentCheckBuf,
+    params.shortUrl,
+    24
+  );
+
   const svgString = buildCrispSvg({
     matrix: chosenMatrix,
     sizePx: params.sizePx,
@@ -315,8 +412,10 @@ export function generateVerifiedQr(params: {
     effectiveMargin: chosen.margin,
     autoAdjusted: chosen.ecl !== params.errorCorrection || chosen.margin !== params.safeMargin,
     verified,
+    transparentVerified,
     moduleCount: chosenMatrix.length,
     pngDataUrl,
+    transparentPngDataUrl,
     jpgDataUrl,
     svgString,
     matrix: chosenMatrix,
