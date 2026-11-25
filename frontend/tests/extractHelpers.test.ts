@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   findDuplicateIdNumbers,
   formatColumnCopyText,
+  formatCompactTokenCount,
   formatElapsedTimer,
   formatRowCopyText,
+  getQuotaTubeTone,
   loadExtractModelPrefs,
   saveExtractModelPrefs,
 } from '../src/lib/extractHelpers';
@@ -72,5 +74,20 @@ describe('Phase 2-4 Frontend Extract Helpers & Validation', () => {
       selectedModel: 'gemini-3.6-flash',
       allowFallback: true,
     });
+  });
+
+  it('formats compact token counts and computes green/yellow/red quota tube colors', () => {
+    expect(formatCompactTokenCount(0)).toBe('0');
+    expect(formatCompactTokenCount(850)).toBe('850');
+    expect(formatCompactTokenCount(1520)).toBe('1.5K');
+    expect(formatCompactTokenCount(998500)).toBe('999K');
+    expect(formatCompactTokenCount(1000000)).toBe('1M');
+
+    expect(getQuotaTubeTone(100, 'ready').tone).toBe('green');
+    expect(getQuotaTubeTone(51, 'ready').tone).toBe('green');
+    expect(getQuotaTubeTone(50, 'ready').tone).toBe('yellow');
+    expect(getQuotaTubeTone(21, 'ready').tone).toBe('yellow');
+    expect(getQuotaTubeTone(20, 'ready').tone).toBe('red');
+    expect(getQuotaTubeTone(0, 'cooldown').tone).toBe('red');
   });
 });

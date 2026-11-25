@@ -8,6 +8,7 @@ import {
   Copy,
   FileArchive,
   FileText,
+  KeyRound,
   Loader2,
   Pencil,
   RefreshCw,
@@ -24,13 +25,16 @@ import {
   type ExtractedIdType,
   type GeminiModelOption,
   type IngestedExtractItem,
+  type PublicKeyQuotaSnapshot,
 } from '../lib/api';
 import {
   DEFAULT_GEMINI_MODELS,
   findDuplicateIdNumbers,
   formatColumnCopyText,
+  formatCompactTokenCount,
   formatElapsedTimer,
   formatRowCopyText,
+  getQuotaTubeTone,
   getShortModelBadge,
   loadExtractModelPrefs,
   saveExtractModelPrefs,
@@ -103,6 +107,7 @@ export function AllFilesDataSection() {
     models: [...DEFAULT_GEMINI_MODELS],
   });
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [quota, setQuota] = useState<PublicKeyQuotaSnapshot | null>(null);
 
   const initialPrefs = useMemo(() => loadExtractModelPrefs(), []);
   const [selectedModel, setSelectedModel] = useState<string>(initialPrefs.selectedModel);
@@ -162,6 +167,7 @@ export function AllFilesDataSection() {
       .then((cfg) => {
         if (!mounted) return;
         setConfig(cfg);
+        if (cfg.quota) setQuota(cfg.quota);
         setConfigLoaded(true);
       })
       .catch(() => {
@@ -288,6 +294,10 @@ export function AllFilesDataSection() {
           excludeModels: params.excludeModels,
         });
 
+        if (res.quota) {
+          setQuota(res.quota);
+        }
+
         const elapsed = Math.max(1, Date.now() - startTs);
         const docs = res.documents.length > 0 ? res.documents : [
           { pageNumber: null, name: null, idNumber: null, idType: null, nationality: null, confidence: null },
@@ -376,6 +386,12 @@ export function AllFilesDataSection() {
       } catch (err) {
         const elapsed = Math.max(1, Date.now() - startTs);
         const message = err instanceof Error ? err.message : 'Extraction failed.';
+        void extractApi
+          .getConfig()
+          .then((cfg) => {
+            if (cfg.quota) setQuota(cfg.quota);
+          })
+          .catch(() => {});
         setRows((prev) =>
           prev.map((r) =>
             r.rowId === params.rowId
@@ -828,6 +844,86 @@ export function AllFilesDataSection() {
           </span>
         </div>
       </div>
+
+      {/* Active API Key Usage & Quota Tube (Image 2 red box area) */}
+      {quota && (
+        <div className="bg-white rounded-2xl border border-slate-200/90 shadow-xs px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1.5 font-bold text-[#0A1832]">
+              <KeyRound className="w-3.5 h-3.5 text-[#D9A441]" />
+              {quota.totalKeys === 0
+                ? 'No API Keys Configured'
+                : quota.totalKeys === 1
+                ? 'API Key 1 of 1'
+                : `Active Key ${quota.activeKeyNumber} of ${quota.totalKeys}`}
+            </span>
+
+            {quota.totalKeys > 1 && (
+              <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 font-semibold">
+                {quota.keysUsedToday}/{quota.totalKeys} Keys Used
+              </span>
+            )}
+
+            {quota.exhaustedKeysCount > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-rose-50 border border-rose-200 text-rose-700 font-semibold">
+                {quota.exhaustedKeysCount} Cooldown / Exhausted
+              </span>
+            )}
+
+            {quota.activeKeyStatus === 'cooldown' && (
+              <span className="px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 font-semibold">
+                Cooldown
+              </span>
+            )}
+          </div>
+
+          {quota.totalKeys > 0 &&
+            (() => {
+              const tube = getQuotaTubeTone(quota.remainingPct, quota.activeKeyStatus);
+              return (
+                <div
+                  className="flex flex-wrap items-center gap-2.5 ml-auto"
+                  title={`Key #${quota.activeKeyNumber}: ${quota.tokensUsedToday.toLocaleString()} tokens used today, ${quota.tokensRemaining.toLocaleString()} left out of ${quota.dailyTokenBudget.toLocaleString()} daily token budget (${quota.requestsToday} requests).`}
+                >
+                  <span className="text-[11px] font-semibold text-slate-600 tabular-nums">
+                    Used:{' '}
+                    <strong className="text-[#0A1832]">
+                      {formatCompactTokenCount(quota.tokensUsedToday)}
+                    </strong>{' '}
+                    &middot; Left:{' '}
+                    <strong className={tube.textClass}>
+                      {formatCompactTokenCount(quota.tokensRemaining)}
+                    </strong>{' '}
+                    <span className="text-slate-400">
+                      / {formatCompactTokenCount(quota.dailyTokenBudget)} tokens
+                    </span>
+                  </span>
+
+                  <div className="flex items-center gap-1.5">
+                    <div
+                      className="h-2.5 w-28 sm:w-36 rounded-full bg-slate-200 overflow-hidden border border-slate-200/80"
+                      role="progressbar"
+                      aria-valuenow={quota.remainingPct}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-label="Active API key remaining token quota"
+                    >
+                      <div
+                        className={`h-full rounded-full transition-all duration-300 ${tube.barClass}`}
+                        style={{ width: `${quota.remainingPct}%` }}
+                      />
+                    </div>
+                    <span
+                      className={`px-1.5 py-0.5 rounded-md border text-[10px] font-extrabold tabular-nums ${tube.badgeClass}`}
+                    >
+                      {quota.remainingPct}%
+                    </span>
+                  </div>
+                </div>
+              );
+            })()}
+        </div>
+      )}
 
       {/* Upload Dropzone Card */}
       <div className="bg-white rounded-2xl border border-slate-200/80 shadow-[0_12px_35px_-12px_rgba(10,24,50,0.08)] p-5 space-y-4">

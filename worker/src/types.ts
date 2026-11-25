@@ -103,6 +103,17 @@ export interface ExtractSettingsRow {
   concurrency: number;
   inline_threshold_mb: number;
   key_rr_cursor: number;
+  daily_token_budget: number;
+}
+
+export interface GeminiKeyDailyUsageRow {
+  key_hash: string;
+  usage_date: string;
+  prompt_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  requests_count: number;
+  last_used_at: number;
 }
 
 export interface ExtractionFileRow {

@@ -24,6 +24,7 @@ export const GEMINI_MODEL_CONFIG = {
   defaultMaxPdfMb: 50,
   defaultConcurrency: 5,
   defaultInlineThresholdMb: 4,
+  defaultDailyTokenBudget: 1_000_000,
   models: [
     {
       id: 'gemini-3.6-flash',

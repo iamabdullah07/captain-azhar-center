@@ -131,3 +131,49 @@ export function getShortModelBadge(modelId: string | null): string {
   };
   return map[modelId] ?? modelId;
 }
+
+export function formatCompactTokenCount(tokens: number): string {
+  const safe = Math.max(0, Math.round(tokens));
+  if (safe >= 1_000_000) {
+    const m = safe / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(2).replace(/\.?0+$/, '')}M`;
+  }
+  if (safe >= 1_000) {
+    const k = safe / 1_000;
+    return `${k >= 100 ? Math.round(k) : Number(k.toFixed(1))}K`;
+  }
+  return String(safe);
+}
+
+export function getQuotaTubeTone(
+  remainingPct: number,
+  status: 'ready' | 'cooldown' | 'exhausted' | 'none'
+): {
+  tone: 'green' | 'yellow' | 'red';
+  barClass: string;
+  textClass: string;
+  badgeClass: string;
+} {
+  if (status === 'cooldown' || status === 'exhausted' || status === 'none' || remainingPct <= 20) {
+    return {
+      tone: 'red',
+      barClass: 'bg-rose-500',
+      textClass: 'text-rose-700',
+      badgeClass: 'bg-rose-50 border-rose-200 text-rose-700',
+    };
+  }
+  if (remainingPct <= 50) {
+    return {
+      tone: 'yellow',
+      barClass: 'bg-amber-400',
+      textClass: 'text-amber-800',
+      badgeClass: 'bg-amber-50 border-amber-200 text-amber-800',
+    };
+  }
+  return {
+    tone: 'green',
+    barClass: 'bg-emerald-500',
+    textClass: 'text-emerald-700',
+    badgeClass: 'bg-emerald-50 border-emerald-200 text-emerald-700',
+  };
+}

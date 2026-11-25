@@ -262,6 +262,11 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
               },
             },
           ],
+          usageMetadata: {
+            promptTokenCount: 1200,
+            candidatesTokenCount: 300,
+            totalTokenCount: 1500,
+          },
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
@@ -306,10 +311,30 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
     expect(runRes.status).toBe(200);
     const runData = (await runRes.json()) as {
       modelUsed: string;
+      tokenUsage: { promptTokens: number; outputTokens: number; totalTokens: number };
+      quota: {
+        totalKeys: number;
+        keysUsedToday: number;
+        exhaustedKeysCount: number;
+        activeKeyNumber: number;
+        tokensUsedToday: number;
+        tokensRemaining: number;
+        remainingPct: number;
+      };
       documents: Array<{ name: string; idNumber: string; idType: string; nationality: string }>;
     };
 
     expect(runData.modelUsed).toBe('gemini-3.5-flash-lite');
+    expect(runData.tokenUsage).toEqual({ promptTokens: 1200, outputTokens: 300, totalTokens: 1500 });
+    expect(runData.quota).toMatchObject({
+      totalKeys: 2,
+      keysUsedToday: 2,
+      exhaustedKeysCount: 1,
+      activeKeyNumber: 2,
+      tokensUsedToday: 1500,
+      tokensRemaining: 998500,
+      remainingPct: 100,
+    });
     expect(runData.documents[0]).toMatchObject({
       name: 'AHMED RAZA',
       idNumber: '2345678901',
@@ -423,6 +448,11 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
               },
             },
           ],
+          usageMetadata: {
+            promptTokenCount: 1200,
+            candidatesTokenCount: 300,
+            totalTokenCount: 1500,
+          },
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );

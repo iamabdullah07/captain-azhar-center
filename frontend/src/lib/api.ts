@@ -444,6 +444,7 @@ export const adminApi = {
       maxPdfMb: number;
       concurrency: number;
       inlineThresholdMb: number;
+      dailyTokenBudget: number;
       maxKeysLimit: number;
       envKeysCount: number;
       totalConfiguredCount: number;
@@ -453,12 +454,14 @@ export const adminApi = {
     maxPdfMb?: number;
     concurrency?: number;
     inlineThresholdMb?: number;
+    dailyTokenBudget?: number;
   }) =>
     adminFetch<{
       ok: boolean;
       maxPdfMb: number;
       concurrency: number;
       inlineThresholdMb: number;
+      dailyTokenBudget: number;
     }>('/extract-settings', {
       method: 'PATCH',
       body: JSON.stringify(payload),
@@ -496,6 +499,19 @@ export interface GeminiModelOption {
   description: string;
 }
 
+export interface PublicKeyQuotaSnapshot {
+  totalKeys: number;
+  keysUsedToday: number;
+  exhaustedKeysCount: number;
+  activeKeyNumber: number;
+  activeKeyStatus: 'ready' | 'cooldown' | 'exhausted' | 'none';
+  dailyTokenBudget: number;
+  tokensUsedToday: number;
+  tokensRemaining: number;
+  remainingPct: number;
+  requestsToday: number;
+}
+
 export interface ExtractConfigResponse {
   ok: boolean;
   maxPdfMb: number;
@@ -505,6 +521,7 @@ export interface ExtractConfigResponse {
   activeKeyCount: number;
   wordToPdfEnabled: boolean;
   models: GeminiModelOption[];
+  quota?: PublicKeyQuotaSnapshot;
 }
 
 export interface IngestedExtractItem {
@@ -538,6 +555,8 @@ export interface RunExtractResponse {
   fileId: string;
   modelUsed: string;
   durationMs: number;
+  tokenUsage?: { promptTokens: number; outputTokens: number; totalTokens: number };
+  quota?: PublicKeyQuotaSnapshot;
   documents: ExtractedDocumentRecord[];
   attempts: Array<{ model: string; status: 'ok' | 'retry' | 'failed'; reason?: string }>;
   error?: string;
@@ -555,6 +574,8 @@ export interface AdminGeminiKeySummary {
   errorCount: number;
   lastError: string | null;
   createdAt: number;
+  tokensUsedToday?: number;
+  requestsToday?: number;
 }
 
 export const extractApi = {

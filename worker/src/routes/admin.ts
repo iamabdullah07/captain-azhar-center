@@ -762,6 +762,7 @@ export function createAdminRoutes() {
       maxPdfMb: settings.max_pdf_mb,
       concurrency: settings.concurrency,
       inlineThresholdMb: settings.inline_threshold_mb,
+      dailyTokenBudget: settings.daily_token_budget,
       maxKeysLimit: GEMINI_MODEL_CONFIG.maxApiKeys,
       envKeysCount: keyInfo.envKeysCount,
       totalConfiguredCount: keyInfo.totalConfiguredCount,
@@ -770,7 +771,12 @@ export function createAdminRoutes() {
   });
 
   app.patch('/extract-settings', async (c) => {
-    let body: { maxPdfMb?: number; concurrency?: number; inlineThresholdMb?: number };
+    let body: {
+      maxPdfMb?: number;
+      concurrency?: number;
+      inlineThresholdMb?: number;
+      dailyTokenBudget?: number;
+    };
     try {
       body = await c.req.json();
     } catch {
@@ -781,6 +787,7 @@ export function createAdminRoutes() {
     const maxPdfMb = body.maxPdfMb ?? current.max_pdf_mb;
     const concurrency = body.concurrency ?? current.concurrency;
     const inlineThresholdMb = body.inlineThresholdMb ?? current.inline_threshold_mb;
+    const dailyTokenBudget = body.dailyTokenBudget ?? current.daily_token_budget;
 
     if (!Number.isInteger(maxPdfMb) || maxPdfMb < 5 || maxPdfMb > 50) {
       return c.json({ error: 'Max PDF size must be an integer between 5 MB and 50 MB.' }, 400);
@@ -791,17 +798,23 @@ export function createAdminRoutes() {
     if (!Number.isInteger(inlineThresholdMb) || inlineThresholdMb < 1 || inlineThresholdMb > 15) {
       return c.json({ error: 'Inline threshold must be an integer between 1 MB and 15 MB.' }, 400);
     }
+    if (!Number.isInteger(dailyTokenBudget) || dailyTokenBudget < 10_000 || dailyTokenBudget > 100_000_000) {
+      return c.json(
+        { error: 'Daily token budget must be an integer between 10,000 and 100,000,000.' },
+        400
+      );
+    }
 
     await c.env.DB
       .prepare(
         `UPDATE extract_settings
-         SET max_pdf_mb = ?, concurrency = ?, inline_threshold_mb = ?
+         SET max_pdf_mb = ?, concurrency = ?, inline_threshold_mb = ?, daily_token_budget = ?
          WHERE id = 1`
       )
-      .bind(maxPdfMb, concurrency, inlineThresholdMb)
+      .bind(maxPdfMb, concurrency, inlineThresholdMb, dailyTokenBudget)
       .run();
 
-    return c.json({ ok: true, maxPdfMb, concurrency, inlineThresholdMb });
+    return c.json({ ok: true, maxPdfMb, concurrency, inlineThresholdMb, dailyTokenBudget });
   });
 
   app.post('/gemini-keys', async (c) => {

@@ -17,7 +17,11 @@ import {
   sha256Hex,
 } from '../services/cryptoUtils';
 import { extractDocumentWithGemini, GeminiExtractionError } from '../services/geminiExtractor';
-import { getExtractSettings, loadActiveGeminiKeyPool } from '../services/geminiKeys';
+import {
+  getExtractSettings,
+  getPublicQuotaSnapshot,
+  loadActiveGeminiKeyPool,
+} from '../services/geminiKeys';
 import { checkRateLimit, formatRateWindowLabel, getClientIp, getUploadRateLimitConfig } from '../services/rateLimit';
 import { verifyTurnstileToken } from '../services/turnstile';
 import { sanitizeDisplayFilename } from '../services/urlValidator';
@@ -261,6 +265,7 @@ export function createExtractRoutes(deps: ExtractRouteDeps = {}) {
     const activeKeyCount = pool.length;
     const effectiveConcurrency =
       activeKeyCount > 0 ? Math.max(1, Math.min(settings.concurrency, activeKeyCount)) : 1;
+    const quota = await getPublicQuotaSnapshot({ env: c.env });
 
     return c.json({
       ok: true,
@@ -271,6 +276,7 @@ export function createExtractRoutes(deps: ExtractRouteDeps = {}) {
       activeKeyCount,
       wordToPdfEnabled: Boolean((c.env.WORD_CONVERTER_URL ?? '').trim()),
       models: GEMINI_MODEL_CONFIG.models,
+      quota,
     });
   });
 
@@ -702,23 +708,31 @@ export function createExtractRoutes(deps: ExtractRouteDeps = {}) {
         sleepImpl: deps.sleepImpl,
       });
 
+      const quota = await getPublicQuotaSnapshot({
+        env: c.env,
+        preferredKeyHash: outcome.keyHashUsed,
+      });
+
       return c.json({
         ok: true,
         fileId: row.id,
         modelUsed: outcome.modelUsed,
         durationMs: outcome.durationMs,
+        tokenUsage: outcome.tokenUsage,
+        quota,
         documents: outcome.documents,
         attempts: outcome.attempts,
       });
     } catch (err) {
+      const quota = await getPublicQuotaSnapshot({ env: c.env }).catch(() => undefined);
       if (err instanceof GeminiExtractionError) {
         return c.json(
-          { error: err.message, attempts: err.attempts },
+          { error: err.message, attempts: err.attempts, ...(quota ? { quota } : {}) },
           err.statusCode as 400 | 429 | 502 | 503 | 504
         );
       }
       return c.json(
-        { error: err instanceof Error ? err.message : 'Extraction failed.' },
+        { error: err instanceof Error ? err.message : 'Extraction failed.', ...(quota ? { quota } : {}) },
         502
       );
     }

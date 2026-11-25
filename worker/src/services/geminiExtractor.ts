@@ -11,10 +11,13 @@ import {
   recordGeminiKeyCooldown,
   recordGeminiKeySuccess,
   type PooledGeminiKey,
+  type TokenUsageCounts,
 } from './geminiKeys';
 
 export interface ExtractionAttemptOutcome {
   modelUsed: string;
+  keyHashUsed: string;
+  tokenUsage: TokenUsageCounts;
   durationMs: number;
   documents: NormalizedExtractedDoc[];
   attempts: Array<{ model: string; status: 'ok' | 'retry' | 'failed'; reason?: string }>;
@@ -456,6 +459,11 @@ export async function extractDocumentWithGemini(params: {
 
           const payload = (await response.json().catch(() => null)) as {
             candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+            usageMetadata?: {
+              promptTokenCount?: number;
+              candidatesTokenCount?: number;
+              totalTokenCount?: number;
+            };
           } | null;
 
           const textParts = (payload?.candidates?.[0]?.content?.parts ?? [])
@@ -476,7 +484,22 @@ export async function extractDocumentWithGemini(params: {
             break;
           }
 
-          await recordGeminiKeySuccess(env.DB, activeKey);
+          const promptTokens = Math.max(0, Math.floor(payload?.usageMetadata?.promptTokenCount ?? 0));
+          const outputTokens = Math.max(
+            0,
+            Math.floor(payload?.usageMetadata?.candidatesTokenCount ?? 0)
+          );
+          const totalTokens = Math.max(
+            0,
+            Math.floor(payload?.usageMetadata?.totalTokenCount ?? promptTokens + outputTokens)
+          );
+          const tokenUsage: TokenUsageCounts = {
+            promptTokens,
+            outputTokens,
+            totalTokens,
+          };
+
+          await recordGeminiKeySuccess(env.DB, activeKey, Date.now(), tokenUsage);
 
           const normalizedDocs =
             parsedDocs.length > 0
@@ -495,6 +518,8 @@ export async function extractDocumentWithGemini(params: {
           attempts.push({ model: model.id, status: 'ok' });
           return {
             modelUsed: model.id,
+            keyHashUsed: activeKey.keyHash,
+            tokenUsage,
             durationMs: Math.max(1, Date.now() - startedAt),
             documents: normalizedDocs,
             attempts,

@@ -3,9 +3,29 @@ import type {
   Env,
   ExtractSettingsRow,
   GeminiApiKeyRow,
+  GeminiKeyDailyUsageRow,
   GeminiKeyRuntimeRow,
 } from '../types';
 import { bytesToHex, hexToBytes, sha256Hex } from './cryptoUtils';
+
+export interface TokenUsageCounts {
+  promptTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface PublicKeyQuotaSnapshot {
+  totalKeys: number;
+  keysUsedToday: number;
+  exhaustedKeysCount: number;
+  activeKeyNumber: number;
+  activeKeyStatus: 'ready' | 'cooldown' | 'exhausted' | 'none';
+  dailyTokenBudget: number;
+  tokensUsedToday: number;
+  tokensRemaining: number;
+  remainingPct: number;
+  requestsToday: number;
+}
 
 export interface PooledGeminiKey {
   id: string | null;
@@ -30,6 +50,8 @@ export interface MaskedKeySummary {
   errorCount: number;
   lastError: string | null;
   createdAt: number;
+  tokensUsedToday: number;
+  requestsToday: number;
 }
 
 const KEY_DERIVE_PREFIX = 'gemini-api-key-aes-v1:';
@@ -97,6 +119,10 @@ export function parseEnvGeminiKeys(env: Pick<Env, 'GEMINI_API_KEY' | 'GEMINI_API
   return Array.from(new Set(rawList)).slice(0, GEMINI_MODEL_CONFIG.maxApiKeys);
 }
 
+export function getTodayUtcDateStr(now = Date.now()): string {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
 export async function getExtractSettings(env: Env): Promise<ExtractSettingsRow> {
   const row = await env.DB
     .prepare('SELECT * FROM extract_settings WHERE id = 1')
@@ -110,19 +136,24 @@ export async function getExtractSettings(env: Env): Promise<ExtractSettingsRow> 
       ...row,
       max_pdf_mb: Number.isFinite(envMaxPdf) && envMaxPdf > 0 ? envMaxPdf : row.max_pdf_mb,
       concurrency: Number.isFinite(envConc) && envConc > 0 ? envConc : row.concurrency,
+      daily_token_budget:
+        Number.isFinite(row.daily_token_budget) && row.daily_token_budget > 0
+          ? row.daily_token_budget
+          : GEMINI_MODEL_CONFIG.defaultDailyTokenBudget,
     };
   }
 
   await env.DB
     .prepare(
       `INSERT OR IGNORE INTO extract_settings
-       (id, max_pdf_mb, concurrency, inline_threshold_mb, key_rr_cursor)
-       VALUES (1, ?, ?, ?, 0)`
+       (id, max_pdf_mb, concurrency, inline_threshold_mb, key_rr_cursor, daily_token_budget)
+       VALUES (1, ?, ?, ?, 0, ?)`
     )
     .bind(
       GEMINI_MODEL_CONFIG.defaultMaxPdfMb,
       GEMINI_MODEL_CONFIG.defaultConcurrency,
-      GEMINI_MODEL_CONFIG.defaultInlineThresholdMb
+      GEMINI_MODEL_CONFIG.defaultInlineThresholdMb,
+      GEMINI_MODEL_CONFIG.defaultDailyTokenBudget
     )
     .run();
 
@@ -132,6 +163,7 @@ export async function getExtractSettings(env: Env): Promise<ExtractSettingsRow> 
     concurrency: Number.isFinite(envConc) && envConc > 0 ? envConc : GEMINI_MODEL_CONFIG.defaultConcurrency,
     inline_threshold_mb: GEMINI_MODEL_CONFIG.defaultInlineThresholdMb,
     key_rr_cursor: 0,
+    daily_token_budget: GEMINI_MODEL_CONFIG.defaultDailyTokenBudget,
   };
 }
 
@@ -259,32 +291,56 @@ export async function pickRoundRobinKey(params: {
 export async function recordGeminiKeySuccess(
   db: D1Database,
   key: PooledGeminiKey,
-  now = Date.now()
+  now = Date.now(),
+  tokenUsage?: TokenUsageCounts
 ): Promise<void> {
+  const usageDate = getTodayUtcDateStr(now);
+  const promptTokens = Math.max(0, Math.floor(tokenUsage?.promptTokens ?? 0));
+  const outputTokens = Math.max(0, Math.floor(tokenUsage?.outputTokens ?? 0));
+  const totalTokens = Math.max(0, Math.floor(tokenUsage?.totalTokens ?? promptTokens + outputTokens));
+
+  const usageStmt = db
+    .prepare(
+      `INSERT INTO gemini_key_daily_usage
+       (key_hash, usage_date, prompt_tokens, output_tokens, total_tokens, requests_count, last_used_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?)
+       ON CONFLICT(key_hash, usage_date) DO UPDATE SET
+         prompt_tokens = gemini_key_daily_usage.prompt_tokens + excluded.prompt_tokens,
+         output_tokens = gemini_key_daily_usage.output_tokens + excluded.output_tokens,
+         total_tokens = gemini_key_daily_usage.total_tokens + excluded.total_tokens,
+         requests_count = gemini_key_daily_usage.requests_count + 1,
+         last_used_at = excluded.last_used_at`
+    )
+    .bind(key.keyHash, usageDate, promptTokens, outputTokens, totalTokens, now);
+
   if (key.source === 'db' && key.id) {
-    await db
-      .prepare(
-        `UPDATE gemini_api_keys
-         SET last_used_at = ?, success_count = success_count + 1, cooldown_until = 0, last_error = NULL
-         WHERE id = ?`
-      )
-      .bind(now, key.id)
-      .run();
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE gemini_api_keys
+           SET last_used_at = ?, success_count = success_count + 1, cooldown_until = 0, last_error = NULL
+           WHERE id = ?`
+        )
+        .bind(now, key.id),
+      usageStmt,
+    ]);
     return;
   }
 
-  await db
-    .prepare(
-      `INSERT INTO gemini_key_runtime (key_hash, cooldown_until, last_used_at, success_count, error_count, last_error)
-       VALUES (?, 0, ?, 1, 0, NULL)
-       ON CONFLICT(key_hash) DO UPDATE SET
-         cooldown_until = 0,
-         last_used_at = excluded.last_used_at,
-         success_count = gemini_key_runtime.success_count + 1,
-         last_error = NULL`
-    )
-    .bind(key.keyHash, now)
-    .run();
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO gemini_key_runtime (key_hash, cooldown_until, last_used_at, success_count, error_count, last_error)
+         VALUES (?, 0, ?, 1, 0, NULL)
+         ON CONFLICT(key_hash) DO UPDATE SET
+           cooldown_until = 0,
+           last_used_at = excluded.last_used_at,
+           success_count = gemini_key_runtime.success_count + 1,
+           last_error = NULL`
+      )
+      .bind(key.keyHash, now),
+    usageStmt,
+  ]);
 }
 
 export async function recordGeminiKeyCooldown(params: {
@@ -327,6 +383,112 @@ export async function recordGeminiKeyCooldown(params: {
     .run();
 }
 
+export async function getPublicQuotaSnapshot(params: {
+  env: Env;
+  preferredKeyHash?: string | null;
+  now?: number;
+}): Promise<PublicKeyQuotaSnapshot> {
+  const { env, preferredKeyHash } = params;
+  const now = params.now ?? Date.now();
+  const today = getTodayUtcDateStr(now);
+
+  const [settings, pool, dailyRes] = await Promise.all([
+    getExtractSettings(env),
+    loadActiveGeminiKeyPool(env),
+    env.DB
+      .prepare('SELECT * FROM gemini_key_daily_usage WHERE usage_date = ?')
+      .bind(today)
+      .all<GeminiKeyDailyUsageRow>(),
+  ]);
+
+  const budget = settings.daily_token_budget || GEMINI_MODEL_CONFIG.defaultDailyTokenBudget;
+  if (pool.length === 0) {
+    return {
+      totalKeys: 0,
+      keysUsedToday: 0,
+      exhaustedKeysCount: 0,
+      activeKeyNumber: 0,
+      activeKeyStatus: 'none',
+      dailyTokenBudget: budget,
+      tokensUsedToday: 0,
+      tokensRemaining: 0,
+      remainingPct: 0,
+      requestsToday: 0,
+    };
+  }
+
+  const usageByHash = new Map<string, GeminiKeyDailyUsageRow>();
+  for (const row of dailyRes.results ?? []) {
+    usageByHash.set(row.key_hash, row);
+  }
+
+  let keysUsedToday = 0;
+  let exhaustedKeysCount = 0;
+
+  for (const k of pool) {
+    const u = usageByHash.get(k.keyHash);
+    const usedTokens = u?.total_tokens ?? 0;
+    const reqs = u?.requests_count ?? 0;
+    const inCooldown = k.cooldownUntil > now;
+    if (reqs > 0 || inCooldown) {
+      keysUsedToday += 1;
+    }
+    if (inCooldown || usedTokens >= budget) {
+      exhaustedKeysCount += 1;
+    }
+  }
+
+  // Pick which single key to report right now:
+  // 1) If preferredKeyHash (just executed) exists, report that key.
+  // 2) Otherwise report the next ready key at cursor (or most recently used if all in cooldown).
+  let selectedIdx = -1;
+  if (preferredKeyHash) {
+    selectedIdx = pool.findIndex((k) => k.keyHash === preferredKeyHash);
+  }
+  if (selectedIdx === -1) {
+    const cursor = Math.max(0, settings.key_rr_cursor ?? 0);
+    for (let offset = 0; offset < pool.length; offset++) {
+      const idx = (cursor + offset) % pool.length;
+      if (pool[idx].cooldownUntil <= now) {
+        selectedIdx = idx;
+        break;
+      }
+    }
+    if (selectedIdx === -1) {
+      selectedIdx = cursor % pool.length;
+    }
+  }
+
+  const activeKey = pool[selectedIdx];
+  const activeUsage = usageByHash.get(activeKey.keyHash);
+  const tokensUsedToday = activeUsage?.total_tokens ?? 0;
+  const requestsToday = activeUsage?.requests_count ?? 0;
+  const inCooldown = activeKey.cooldownUntil > now;
+  const tokensRemaining = inCooldown ? 0 : Math.max(0, budget - tokensUsedToday);
+  const remainingPct = inCooldown
+    ? 0
+    : Math.max(0, Math.min(100, Math.round((tokensRemaining / budget) * 100)));
+
+  const activeKeyStatus: PublicKeyQuotaSnapshot['activeKeyStatus'] = inCooldown
+    ? 'cooldown'
+    : tokensRemaining <= 0
+    ? 'exhausted'
+    : 'ready';
+
+  return {
+    totalKeys: pool.length,
+    keysUsedToday,
+    exhaustedKeysCount,
+    activeKeyNumber: selectedIdx + 1,
+    activeKeyStatus,
+    dailyTokenBudget: budget,
+    tokensUsedToday,
+    tokensRemaining,
+    remainingPct,
+    requestsToday,
+  };
+}
+
 /**
  * Returns masked key metadata ONLY (never exposes raw API keys).
  */
@@ -335,20 +497,33 @@ export async function listMaskedKeysForAdmin(env: Env): Promise<{
   envKeysCount: number;
   totalConfiguredCount: number;
 }> {
-  const dbRows = await env.DB
-    .prepare(
-      `SELECT id, label, masked_key, key_hash, enabled, cooldown_until, last_used_at,
-              success_count, error_count, last_error, created_at
-       FROM gemini_api_keys
-       ORDER BY created_at DESC`
-    )
-    .all<Omit<GeminiApiKeyRow, 'encrypted_key'>>();
+  const today = getTodayUtcDateStr();
+  const [dbRows, dailyRows] = await Promise.all([
+    env.DB
+      .prepare(
+        `SELECT id, label, masked_key, key_hash, enabled, cooldown_until, last_used_at,
+                success_count, error_count, last_error, created_at
+         FROM gemini_api_keys
+         ORDER BY created_at DESC`
+      )
+      .all<Omit<GeminiApiKeyRow, 'encrypted_key'>>(),
+    env.DB
+      .prepare('SELECT * FROM gemini_key_daily_usage WHERE usage_date = ?')
+      .bind(today)
+      .all<GeminiKeyDailyUsageRow>(),
+  ]);
+
+  const dailyMap = new Map<string, GeminiKeyDailyUsageRow>();
+  for (const u of dailyRows.results ?? []) {
+    dailyMap.set(u.key_hash, u);
+  }
 
   const seenHashes = new Set<string>();
   const result: MaskedKeySummary[] = [];
 
   for (const r of dbRows.results ?? []) {
     seenHashes.add(r.key_hash);
+    const usage = dailyMap.get(r.key_hash);
     result.push({
       id: r.id,
       source: 'db',
@@ -361,6 +536,8 @@ export async function listMaskedKeysForAdmin(env: Env): Promise<{
       errorCount: r.error_count,
       lastError: r.last_error,
       createdAt: r.created_at,
+      tokensUsedToday: usage?.total_tokens ?? 0,
+      requestsToday: usage?.requests_count ?? 0,
     });
   }
 
@@ -377,6 +554,7 @@ export async function listMaskedKeysForAdmin(env: Env): Promise<{
       seenHashes.add(kHash);
       envCount += 1;
       const rt = rtMap.get(kHash);
+      const usage = dailyMap.get(kHash);
       result.push({
         id: `env-${i + 1}`,
         source: 'env',
@@ -389,6 +567,8 @@ export async function listMaskedKeysForAdmin(env: Env): Promise<{
         errorCount: rt?.error_count ?? 0,
         lastError: rt?.last_error ?? null,
         createdAt: 0,
+        tokensUsedToday: usage?.total_tokens ?? 0,
+        requestsToday: usage?.requests_count ?? 0,
       });
     }
   }
