@@ -1,4 +1,4 @@
-const CACHE_NAME = 'captain-azhar-qr-v2';
+const CACHE_NAME = 'captain-azhar-qr-v3';
 const SHELL_ASSETS = ['./', './index.html', './manifest.webmanifest', './logo.png', './favicon.png'];
 
 self.addEventListener('install', (event) => {

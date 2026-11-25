@@ -27,6 +27,8 @@ EMAIL_PROVIDER = "resend"
 EMAIL_FROM = "Captain Azhar Center <onboarding@resend.dev>"
 APP_NAME = "Captain Azhar Center"
 SAME_ORIGIN_COOKIES = "false"
+UPLOAD_RATE_LIMIT_MAX = "10"
+UPLOAD_RATE_LIMIT_WINDOW_SECONDS = "120"
 
 # Secrets to configure with `npx wrangler secret put <NAME>`:
 # - ADMIN_EMAIL            (owner email — kept in Worker secrets so public repo stays clean)

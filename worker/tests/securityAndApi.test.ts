@@ -1,15 +1,36 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/index';
+import { getUploadRateLimitConfig, UPLOAD_RATE_LIMIT_CONFIG } from '../src/services/rateLimit';
 import { createTestEnv } from './helpers/mockCloudflare';
 
 const ORIGIN = 'https://owner.github.io';
 const CSRF = 'CaptainAzharAdmin';
+const ENC = new TextEncoder();
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
-const PDF_BYTES = new TextEncoder().encode('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF');
+const PDF_BYTES = ENC.encode('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF');
 const MP4_BYTES = new Uint8Array([
   0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x70, 0x34, 0x32,
   0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 ]);
+const MOV_BYTES = new Uint8Array([
+  0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20,
+  0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+]);
+const WEBM_BYTES = (() => {
+  const b = new Uint8Array(32);
+  b.set([0x1a, 0x45, 0xdf, 0xa3], 0);
+  b.set(ENC.encode('webm'), 16);
+  return b;
+})();
+
+function makeFakeOoxmlBytes(marker = '[Content_Types].xml'): Uint8Array {
+  const b = new Uint8Array(64);
+  b.set([0x50, 0x4b, 0x03, 0x04], 0);
+  b.set(ENC.encode(marker), 30);
+  return b;
+}
+
+const OLE2_BYTES = new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x01, 0x02, 0x03, 0x04]);
 
 describe('Public API & Security Verification (Part D7)', () => {
   it('creates short links, blocks unsafe schemes & loops, and redirects with 302', async () => {
@@ -49,7 +70,7 @@ describe('Public API & Security Verification (Part D7)', () => {
     expect(redir.headers.get('Location')).toBe('https://example.com/hello');
   });
 
-  it('uploads verified files with safe serving headers, supports video Range, and honors delete token', async () => {
+  it('uploads verified files with inline PDF/video/image headers, Range 206 streaming, SVG block, and honors delete token', async () => {
     const app = createApp();
     const env = createTestEnv();
 
@@ -70,7 +91,49 @@ describe('Public API & Security Verification (Part D7)', () => {
     );
     expect(badUpload.status).toBe(400);
 
-    // Document PDF upload serves with attachment + nosniff
+    // SVG upload must remain blocked
+    const svgUpload = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': '64',
+          'X-File-Name': 'vector.svg',
+          'X-File-Category': 'image',
+        },
+        body: ENC.encode('<svg xmlns="http://www.w3.org/2000/svg"><script>1</script></svg>'),
+      },
+      env
+    );
+    expect(svgUpload.status).toBe(400);
+
+    // Image upload keeps existing inline + sandbox CSP behavior
+    const imgUpload = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(PNG_BYTES.byteLength),
+          'X-File-Name': 'photo.png',
+          'X-File-Category': 'image',
+        },
+        body: PNG_BYTES,
+      },
+      env
+    );
+    expect(imgUpload.status).toBe(201);
+    const imgData = (await imgUpload.json()) as { id: string };
+    const imgGet = await app.request(`https://worker.local/f/${imgData.id}`, {}, env);
+    expect(imgGet.status).toBe(200);
+    expect(imgGet.headers.get('Content-Type')).toBe('image/png');
+    expect(imgGet.headers.get('Content-Disposition')).toBe('inline; filename="photo.png"');
+    expect(imgGet.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(imgGet.headers.get('Referrer-Policy')).toBe('strict-origin-when-cross-origin');
+    expect(imgGet.headers.get('Content-Security-Policy')).toContain('sandbox');
+
+    // Document PDF upload serves inline with application/pdf + nosniff + PDF-compatible CSP (no sandbox)
     const docUpload = await app.request(
       'https://worker.local/api/upload',
       {
@@ -90,34 +153,69 @@ describe('Public API & Security Verification (Part D7)', () => {
 
     const docGet = await app.request(`https://worker.local/f/${docData.id}`, {}, env);
     expect(docGet.status).toBe(200);
+    expect(docGet.headers.get('Content-Type')).toBe('application/pdf');
     expect(docGet.headers.get('X-Content-Type-Options')).toBe('nosniff');
-    expect(docGet.headers.get('Content-Disposition')).toContain('attachment;');
+    expect(docGet.headers.get('Referrer-Policy')).toBe('strict-origin-when-cross-origin');
+    expect(docGet.headers.get('Content-Disposition')).toBe('inline; filename="manual.pdf"');
+    expect(docGet.headers.get('Accept-Ranges')).toBe('bytes');
+    const pdfCsp = docGet.headers.get('Content-Security-Policy') ?? '';
+    expect(pdfCsp).toContain("default-src 'none'");
+    expect(pdfCsp).toContain("object-src 'self'");
+    expect(pdfCsp).toContain("frame-src 'self'");
+    expect(pdfCsp).not.toContain('sandbox');
+    expect(new Uint8Array(await docGet.arrayBuffer())).toEqual(PDF_BYTES);
 
-    // Video upload supports 206 Partial Content Range requests
-    const vidUpload = await app.request(
-      'https://worker.local/api/upload',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': String(MP4_BYTES.byteLength),
-          'X-File-Name': 'demo.mp4',
-          'X-File-Category': 'video',
+    const docDownload = await app.request(`https://worker.local/f/${docData.id}?download=1`, {}, env);
+    expect(docDownload.status).toBe(200);
+    expect(docDownload.headers.get('Content-Disposition')).toBe('attachment; filename="manual.pdf"');
+
+    // Video uploads (MP4, WEBM, MOV) serve inline with accurate MIME type and 206 Range streaming
+    const videoCases = [
+      { filename: 'demo.mp4', bytes: MP4_BYTES, mime: 'video/mp4' },
+      { filename: 'demo.webm', bytes: WEBM_BYTES, mime: 'video/webm' },
+      { filename: 'demo.mov', bytes: MOV_BYTES, mime: 'video/quicktime' },
+    ];
+
+    for (const vc of videoCases) {
+      const vidUpload = await app.request(
+        'https://worker.local/api/upload',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(vc.bytes.byteLength),
+            'X-File-Name': vc.filename,
+            'X-File-Category': 'video',
+          },
+          body: vc.bytes,
         },
-        body: MP4_BYTES,
-      },
-      env
-    );
-    expect(vidUpload.status).toBe(201);
-    const vidData = (await vidUpload.json()) as { id: string };
+        env
+      );
+      expect(vidUpload.status).toBe(201);
+      const vidData = (await vidUpload.json()) as { id: string };
 
-    const vidRange = await app.request(
-      `https://worker.local/f/${vidData.id}`,
-      { headers: { Range: 'bytes=0-7' } },
-      env
-    );
-    expect(vidRange.status).toBe(206);
-    expect(vidRange.headers.get('Content-Range')).toBe(`bytes 0-7/${MP4_BYTES.byteLength}`);
+      const vidFull = await app.request(`https://worker.local/f/${vidData.id}`, {}, env);
+      expect(vidFull.status).toBe(200);
+      expect(vidFull.headers.get('Content-Type')).toBe(vc.mime);
+      expect(vidFull.headers.get('Content-Disposition')).toBe(`inline; filename="${vc.filename}"`);
+      expect(vidFull.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      expect(vidFull.headers.get('Referrer-Policy')).toBe('strict-origin-when-cross-origin');
+      expect(vidFull.headers.get('Accept-Ranges')).toBe('bytes');
+      expect(vidFull.headers.get('Content-Security-Policy')).toContain("media-src 'self'");
+
+      const vidRange = await app.request(
+        `https://worker.local/f/${vidData.id}`,
+        { headers: { Range: 'bytes=0-7' } },
+        env
+      );
+      expect(vidRange.status).toBe(206);
+      expect(vidRange.headers.get('Content-Type')).toBe(vc.mime);
+      expect(vidRange.headers.get('Content-Disposition')).toBe(`inline; filename="${vc.filename}"`);
+      expect(vidRange.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      expect(vidRange.headers.get('Content-Range')).toBe(`bytes 0-7/${vc.bytes.byteLength}`);
+      expect(vidRange.headers.get('Content-Length')).toBe('8');
+      expect(new Uint8Array(await vidRange.arrayBuffer())).toEqual(vc.bytes.subarray(0, 8));
+    }
 
     // Wrong delete token fails; right delete token removes item
     const wrongDel = await app.request(
@@ -136,6 +234,110 @@ describe('Public API & Security Verification (Part D7)', () => {
 
     const afterDel = await app.request(`https://worker.local/f/${docData.id}`, {}, env);
     expect(afterDel.status).toBe(410);
+  });
+
+  it('serves full-screen Microsoft Office Online viewer page for DOC/DOCX/XLS/XLSX/PPT/PPTX with corner download, fallback, and /f/:id/raw/:filename', async () => {
+    const app = createApp();
+    const env = createTestEnv();
+
+    const officeCases = [
+      { ext: 'doc', filename: 'legacy-memo.doc', bytes: OLE2_BYTES, mime: 'application/msword' },
+      {
+        ext: 'docx',
+        filename: "Q4 Report & Plan's.docx",
+        bytes: makeFakeOoxmlBytes('word/'),
+        mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      },
+      { ext: 'xls', filename: 'ledger.xls', bytes: OLE2_BYTES, mime: 'application/vnd.ms-excel' },
+      {
+        ext: 'xlsx',
+        filename: 'budget.xlsx',
+        bytes: makeFakeOoxmlBytes('xl/'),
+        mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      },
+      { ext: 'ppt', filename: 'deck.ppt', bytes: OLE2_BYTES, mime: 'application/vnd.ms-powerpoint' },
+      {
+        ext: 'pptx',
+        filename: 'slides.pptx',
+        bytes: makeFakeOoxmlBytes('ppt/'),
+        mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      },
+    ];
+
+    for (const oc of officeCases) {
+      const upload = await app.request(
+        'https://worker.local/api/upload',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(oc.bytes.byteLength),
+            'X-File-Name': encodeURIComponent(oc.filename),
+            'X-File-Category': 'document',
+          },
+          body: oc.bytes,
+        },
+        env
+      );
+      expect(upload.status).toBe(201);
+      const created = (await upload.json()) as { id: string; deleteToken: string };
+
+      // 1. Scanning QR (GET /f/:id) returns full-screen Microsoft Office Online viewer HTML (no top banner/text, no Google viewer)
+      const pageRes = await app.request(`https://worker.local/f/${created.id}`, {}, env);
+      expect(pageRes.status).toBe(200);
+      expect(pageRes.headers.get('Content-Type')).toContain('text/html');
+      expect(pageRes.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      expect(pageRes.headers.get('Referrer-Policy')).toBe('strict-origin-when-cross-origin');
+      const csp = pageRes.headers.get('Content-Security-Policy') ?? '';
+      expect(csp).toContain('frame-src https://view.officeapps.live.com');
+      expect(csp).not.toContain('docs.google.com');
+      const nonceMatch = csp.match(/script-src 'nonce-([^']+)'/);
+      expect(nonceMatch).not.toBeNull();
+
+      const html = await pageRes.text();
+      expect(html).toContain(`<script nonce="${nonceMatch![1]}">`);
+      expect(html).toContain('https://view.officeapps.live.com/op/embed.aspx?src=');
+      expect(html).toContain('class="corner-download"');
+      expect(html).toContain('id="viewer-fallback"');
+      expect(html).not.toContain('<header');
+      expect(html).not.toContain('docs.google.com/gview');
+
+      const rawPathMatch = html.match(new RegExp(`/f/${created.id}/raw/[^"?]+\\.${oc.ext}`));
+      expect(rawPathMatch).not.toBeNull();
+      const rawPath = rawPathMatch![0];
+
+      // 2. Raw public URL serves exact Office MIME type with inline disposition for Microsoft Office Online Viewer
+      const rawRes = await app.request(`https://worker.local${rawPath}`, {}, env);
+      expect(rawRes.status).toBe(200);
+      expect(rawRes.headers.get('Content-Type')).toBe(oc.mime);
+      expect(rawRes.headers.get('Content-Disposition')).toBe(`inline; filename="${oc.filename}"`);
+      expect(rawRes.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      expect(rawRes.headers.get('Accept-Ranges')).toBe('bytes');
+      expect(new Uint8Array(await rawRes.arrayBuffer())).toEqual(oc.bytes);
+
+      // 3. Download link (?download=1) serves attachment disposition
+      const dlRes = await app.request(`https://worker.local${rawPath}?download=1`, {}, env);
+      expect(dlRes.status).toBe(200);
+      expect(dlRes.headers.get('Content-Type')).toBe(oc.mime);
+      expect(dlRes.headers.get('Content-Disposition')).toBe(`attachment; filename="${oc.filename}"`);
+      expect(dlRes.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      expect(new Uint8Array(await dlRes.arrayBuffer())).toEqual(oc.bytes);
+
+      // 4. Direct /f/:id?download=1 also forces attachment download
+      const directDlRes = await app.request(`https://worker.local/f/${created.id}?download=1`, {}, env);
+      expect(directDlRes.status).toBe(200);
+      expect(directDlRes.headers.get('Content-Disposition')).toBe(`attachment; filename="${oc.filename}"`);
+
+      // 5. Deleting item makes both /f/:id and /f/:id/raw/... return 410
+      const delRes = await app.request(
+        `https://worker.local/api/f/${created.id}`,
+        { method: 'DELETE', headers: { 'X-Delete-Token': created.deleteToken } },
+        env
+      );
+      expect(delRes.status).toBe(200);
+      expect((await app.request(`https://worker.local/f/${created.id}`, {}, env)).status).toBe(410);
+      expect((await app.request(`https://worker.local${rawPath}`, {}, env)).status).toBe(410);
+    }
   });
 
   it('stores two distinct uploaded images under unique IDs/R2 keys and returns distinct content per link', async () => {
@@ -607,5 +809,389 @@ describe('Public API & Security Verification (Part D7)', () => {
       env
     );
     expect(loginNew.status).toBe(200);
+  });
+
+  it('enforces 10 uploads per 2 minutes (120s) per IP while keeping delete and report limits intact', async () => {
+    const app = createApp();
+    const env = createTestEnv();
+    const baseTime = 1_700_000_000_000;
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(baseTime);
+
+      const uploadAs = (ip: string) =>
+        app.request(
+          'https://worker.local/api/upload',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': String(PNG_BYTES.byteLength),
+              'X-File-Name': 'rate-check.png',
+              'X-File-Category': 'image',
+              'CF-Connecting-IP': ip,
+            },
+            body: PNG_BYTES,
+          },
+          env
+        );
+
+      let firstUploaded: { id: string; deleteToken: string } | null = null;
+      for (let i = 0; i < 10; i++) {
+        const res = await uploadAs('198.51.100.10');
+        expect(res.status).toBe(201);
+        if (i === 0) {
+          firstUploaded = (await res.json()) as { id: string; deleteToken: string };
+        }
+      }
+
+      // 11th upload inside the 120s window is blocked with <= 120s retry wait
+      vi.setSystemTime(baseTime + 5_000);
+      const blocked = await uploadAs('198.51.100.10');
+      expect(blocked.status).toBe(429);
+      expect(blocked.headers.get('Retry-After')).toBe('115');
+      const blockedJson = (await blocked.json()) as { error: string };
+      expect(blockedJson.error).toBe('Upload limit reached (10/2 min). Please try again in 115s.');
+      const waitMatch = blockedJson.error.match(/in (\d+)s\.$/);
+      expect(waitMatch).not.toBeNull();
+      const waitSec = Number.parseInt(waitMatch![1], 10);
+      expect(waitSec).toBeGreaterThanOrEqual(1);
+      expect(waitSec).toBeLessThanOrEqual(120);
+
+      // Delete remains unrestricted when upload rate limit is active
+      const delRes = await app.request(
+        `https://worker.local/api/f/${firstUploaded!.id}`,
+        {
+          method: 'DELETE',
+          headers: {
+            'X-Delete-Token': firstUploaded!.deleteToken,
+            'CF-Connecting-IP': '198.51.100.10',
+          },
+        },
+        env
+      );
+      expect(delRes.status).toBe(200);
+
+      // Different IP is unaffected
+      const otherIp = await uploadAs('203.0.113.55');
+      expect(otherIp.status).toBe(201);
+
+      // Still blocked at 119s, succeeds at 120s
+      vi.setSystemTime(baseTime + 119_000);
+      const stillBlocked = await uploadAs('198.51.100.10');
+      expect(stillBlocked.status).toBe(429);
+      const stillBlockedJson = (await stillBlocked.json()) as { error: string };
+      expect(stillBlockedJson.error).toBe('Upload limit reached (10/2 min). Please try again in 1s.');
+
+      vi.setSystemTime(baseTime + 120_000);
+      const resetOk = await uploadAs('198.51.100.10');
+      expect(resetOk.status).toBe(201);
+
+      // Report rate limit stays 10/hour (still blocked after 2 minutes)
+      for (let i = 0; i < 10; i++) {
+        const rep = await app.request(
+          'https://worker.local/api/report',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'CF-Connecting-IP': '198.51.100.77',
+            },
+            body: JSON.stringify({ idOrUrl: 'AbC123xY', reason: 'Spam test report entry' }),
+          },
+          env
+        );
+        expect(rep.status).toBe(201);
+      }
+
+      const repBlocked = await app.request(
+        'https://worker.local/api/report',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'CF-Connecting-IP': '198.51.100.77',
+          },
+          body: JSON.stringify({ idOrUrl: 'AbC123xY', reason: 'Spam test report entry' }),
+        },
+        env
+      );
+      expect(repBlocked.status).toBe(429);
+
+      vi.setSystemTime(baseTime + 125_000);
+      const repStillBlocked = await app.request(
+        'https://worker.local/api/report',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'CF-Connecting-IP': '198.51.100.77',
+          },
+          body: JSON.stringify({ idOrUrl: 'AbC123xY', reason: 'Spam test report entry' }),
+        },
+        env
+      );
+      expect(repStillBlocked.status).toBe(429);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('supports configuring upload rate limit via env vars with safe default fallback', async () => {
+    expect(getUploadRateLimitConfig({})).toEqual({
+      maxUploads: UPLOAD_RATE_LIMIT_CONFIG.maxUploads,
+      windowSeconds: UPLOAD_RATE_LIMIT_CONFIG.windowSeconds,
+      windowMs: 120_000,
+    });
+    expect(
+      getUploadRateLimitConfig({
+        UPLOAD_RATE_LIMIT_MAX: '0',
+        UPLOAD_RATE_LIMIT_WINDOW_SECONDS: 'invalid',
+      })
+    ).toEqual({
+      maxUploads: 10,
+      windowSeconds: 120,
+      windowMs: 120_000,
+    });
+
+    const app = createApp();
+    const env = createTestEnv({
+      UPLOAD_RATE_LIMIT_MAX: '2',
+      UPLOAD_RATE_LIMIT_WINDOW_SECONDS: '90',
+    });
+
+    const upload = () =>
+      app.request(
+        'https://worker.local/api/upload',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(PNG_BYTES.byteLength),
+            'X-File-Name': 'env-check.png',
+            'X-File-Category': 'image',
+            'CF-Connecting-IP': '198.51.100.99',
+          },
+          body: PNG_BYTES,
+        },
+        env
+      );
+
+    expect((await upload()).status).toBe(201);
+    expect((await upload()).status).toBe(201);
+    const third = await upload();
+    expect(third.status).toBe(429);
+    const thirdJson = (await third.json()) as { error: string };
+    expect(thirdJson.error).toMatch(/^Upload limit reached \(2\/90s\)\. Please try again in \d+s\.$/);
+  });
+
+  it('reserves a short ID first, commits the final PDF under that ID, keeps original intact, and blocks replay', async () => {
+    const app = createApp();
+    const env = createTestEnv();
+
+    // 1. Upload original PDF
+    const origRes = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(PDF_BYTES.byteLength),
+          'X-File-Name': 'original.pdf',
+          'X-File-Category': 'document',
+        },
+        body: PDF_BYTES,
+      },
+      env
+    );
+    expect(origRes.status).toBe(201);
+    const orig = (await origRes.json()) as { id: string; deleteToken: string; shortUrl: string };
+
+    // 2. Reserve a new short ID using source ticket (bad token rejected first)
+    const badReserve = await app.request(
+      'https://worker.local/api/upload/reserve',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceId: orig.id, deleteToken: 'wrong-token' }),
+      },
+      env
+    );
+    expect(badReserve.status).toBe(403);
+
+    const reserveRes = await app.request(
+      'https://worker.local/api/upload/reserve',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceId: orig.id, deleteToken: orig.deleteToken }),
+      },
+      env
+    );
+    expect(reserveRes.status).toBe(201);
+    const reserved = (await reserveRes.json()) as {
+      id: string;
+      shortUrl: string;
+      reserveToken: string;
+      expiresAt: number;
+    };
+    expect(reserved.id).not.toBe(orig.id);
+    expect(reserved.shortUrl).toBe(`https://worker.local/f/${reserved.id}`);
+
+    // 3. Upload tampered reserve token -> 403
+    const badCommit = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(PDF_BYTES.byteLength),
+          'X-File-Name': 'final-with-qr.pdf',
+          'X-File-Category': 'document',
+          'X-Reserved-Id': reserved.id,
+          'X-Reserve-Token': 'tampered-token',
+        },
+        body: PDF_BYTES,
+      },
+      env
+    );
+    expect(badCommit.status).toBe(403);
+
+    // 4. Commit final PDF under the reserved ID
+    const finalPdfBytes = ENC.encode('%PDF-1.7\n%final-with-qr\n%%EOF');
+    const commitRes = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(finalPdfBytes.byteLength),
+          'X-File-Name': 'original-with-qr.pdf',
+          'X-File-Category': 'document',
+          'X-Reserved-Id': reserved.id,
+          'X-Reserve-Token': reserved.reserveToken,
+        },
+        body: finalPdfBytes,
+      },
+      env
+    );
+    expect(commitRes.status).toBe(201);
+    const committed = (await commitRes.json()) as { id: string; shortUrl: string };
+    expect(committed.id).toBe(reserved.id);
+    expect(committed.shortUrl).toBe(reserved.shortUrl);
+
+    // Both original and final PDFs are accessible independently
+    const getOrig = await app.request(`https://worker.local/f/${orig.id}`, {}, env);
+    expect(getOrig.status).toBe(200);
+    expect(new Uint8Array(await getOrig.arrayBuffer())).toEqual(PDF_BYTES);
+
+    const getFinal = await app.request(`https://worker.local/f/${reserved.id}`, {}, env);
+    expect(getFinal.status).toBe(200);
+    expect(new Uint8Array(await getFinal.arrayBuffer())).toEqual(finalPdfBytes);
+
+    // 5. Replaying same reservation fails
+    const replayRes = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(finalPdfBytes.byteLength),
+          'X-File-Name': 'replay.pdf',
+          'X-File-Category': 'document',
+          'X-Reserved-Id': reserved.id,
+          'X-Reserve-Token': reserved.reserveToken,
+        },
+        body: finalPdfBytes,
+      },
+      env
+    );
+    expect(replayRes.status).toBe(403);
+  });
+
+  it('reports Word converter capability on /api/health and handles /api/convert-word securely', async () => {
+    const app = createApp();
+    const envDisabled = createTestEnv();
+
+    const healthOff = await app.request('https://worker.local/api/health', {}, envDisabled);
+    expect(healthOff.status).toBe(200);
+    expect(((await healthOff.json()) as { wordToPdfEnabled: boolean }).wordToPdfEnabled).toBe(false);
+
+    const docxBytes = makeFakeOoxmlBytes('word/');
+    const convOff = await app.request(
+      'https://worker.local/api/convert-word',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(docxBytes.byteLength),
+          'X-File-Name': 'letter.docx',
+        },
+        body: docxBytes,
+      },
+      envDisabled
+    );
+    expect(convOff.status).toBe(503);
+
+    const envEnabled = createTestEnv({
+      WORD_CONVERTER_URL: 'https://converter.example.test',
+      WORD_CONVERTER_SECRET: 'super-secret-conv',
+    });
+
+    const healthOn = await app.request('https://worker.local/api/health', {}, envEnabled);
+    expect(((await healthOn.json()) as { wordToPdfEnabled: boolean }).wordToPdfEnabled).toBe(true);
+
+    // Non-Word extension rejected before hitting converter
+    const badExt = await app.request(
+      'https://worker.local/api/convert-word',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(PDF_BYTES.byteLength),
+          'X-File-Name': 'not-word.pdf',
+        },
+        body: PDF_BYTES,
+      },
+      envEnabled
+    );
+    expect(badExt.status).toBe(400);
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(PDF_BYTES, {
+        status: 200,
+        headers: { 'Content-Type': 'application/pdf' },
+      })
+    );
+
+    try {
+      const convOk = await app.request(
+        'https://worker.local/api/convert-word',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(docxBytes.byteLength),
+            'X-File-Name': 'letter.docx',
+          },
+          body: docxBytes,
+        },
+        envEnabled
+      );
+      expect(convOk.status).toBe(200);
+      expect(convOk.headers.get('Content-Type')).toBe('application/pdf');
+      expect(new Uint8Array(await convOk.arrayBuffer())).toEqual(PDF_BYTES);
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][0]).toBe('https://converter.example.test/convert');
+      const sentInit = fetchSpy.mock.calls[0][1] as RequestInit;
+      expect((sentInit.headers as Record<string, string>)['Authorization']).toBe(
+        'Bearer super-secret-conv'
+      );
+      expect((sentInit.headers as Record<string, string>)['X-File-Ext']).toBe('docx');
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });

@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  FilePenLine,
   FileText,
   Film,
   Image as ImageIcon,
@@ -11,6 +12,10 @@ import {
   X,
 } from 'lucide-react';
 import { FeatureCards } from '../components/FeatureCards';
+
+const DocumentQrEditor = lazy(() =>
+  import('../components/DocumentQrEditor').then((m) => ({ default: m.DocumentQrEditor }))
+);
 import { QRPreview } from '../components/QRPreview';
 import { TurnstileBox } from '../components/TurnstileBox';
 import {
@@ -59,6 +64,7 @@ function saveRecentRecord(record: CreatedQrRecord) {
 }
 
 export function HomePage() {
+  const [homeSection, setHomeSection] = useState<'generate' | 'edit-file'>('generate');
   const [activeTab, setActiveTab] = useState<InputTab>('link');
   const [urlInput, setUrlInput] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -267,10 +273,49 @@ export function HomePage() {
             Works on Every Phone
           </span>
         </div>
+
+        {/* Two Top-Level Workspace Sections (Red Box 1: Generate QR, Red Box 2: Edit QR in File) */}
+        <div className="mt-7 flex justify-center">
+          <div
+            role="tablist"
+            aria-label="Service sections"
+            className="inline-grid grid-cols-2 gap-1.5 bg-white border border-slate-200/90 shadow-sm p-1.5 rounded-2xl w-full max-w-md"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={homeSection === 'generate'}
+              onClick={() => setHomeSection('generate')}
+              className={`flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
+                homeSection === 'generate'
+                  ? 'bg-[#0A1832] text-[#D9A441] shadow-sm'
+                  : 'text-slate-600 hover:text-[#0A1832] hover:bg-slate-50'
+              }`}
+            >
+              <QrCode className="w-4 h-4 shrink-0" />
+              <span>Generate QR</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={homeSection === 'edit-file'}
+              onClick={() => setHomeSection('edit-file')}
+              className={`flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
+                homeSection === 'edit-file'
+                  ? 'bg-[#0A1832] text-[#D9A441] shadow-sm'
+                  : 'text-slate-600 hover:text-[#0A1832] hover:bg-slate-50'
+              }`}
+            >
+              <FilePenLine className="w-4 h-4 shrink-0" />
+              <span>Edit QR in File</span>
+            </button>
+          </div>
+        </div>
       </section>
 
-      {/* Main 2-column workspace */}
-      <section className="max-w-5xl mx-auto px-4 sm:px-6">
+      {homeSection === 'generate' ? (
+        /* Main 2-column workspace (existing QR Generator workflow unchanged) */
+        <section className="max-w-5xl mx-auto px-4 sm:px-6">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           {/* Left column: Upload & Customize */}
           <form
@@ -606,6 +651,17 @@ export function HomePage() {
           </div>
         </div>
       </section>
+      ) : (
+        <Suspense
+          fallback={
+            <div className="max-w-3xl mx-auto px-4 py-12 text-center text-sm text-slate-500">
+              Loading document editor...
+            </div>
+          }
+        >
+          <DocumentQrEditor />
+        </Suspense>
+      )}
 
       <FeatureCards />
     </main>

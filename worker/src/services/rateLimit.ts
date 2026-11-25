@@ -1,3 +1,57 @@
+import type { Env } from '../types';
+
+export const UPLOAD_RATE_LIMIT_CONFIG = {
+  maxUploads: 10,
+  windowSeconds: 120,
+} as const;
+
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return fallback;
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Resolves upload rate limit settings from Worker env vars with a single constant fallback.
+ */
+export function getUploadRateLimitConfig(
+  env: Pick<Env, 'UPLOAD_RATE_LIMIT_MAX' | 'UPLOAD_RATE_LIMIT_WINDOW_SECONDS'>
+): { maxUploads: number; windowSeconds: number; windowMs: number } {
+  const maxUploads = parsePositiveInt(
+    env.UPLOAD_RATE_LIMIT_MAX,
+    UPLOAD_RATE_LIMIT_CONFIG.maxUploads
+  );
+  const windowSeconds = parsePositiveInt(
+    env.UPLOAD_RATE_LIMIT_WINDOW_SECONDS,
+    UPLOAD_RATE_LIMIT_CONFIG.windowSeconds
+  );
+  return {
+    maxUploads,
+    windowSeconds,
+    windowMs: windowSeconds * 1000,
+  };
+}
+
+export function formatRateWindowLabel(windowSeconds: number): string {
+  if (windowSeconds === 3600) return 'hour';
+  if (windowSeconds % 3600 === 0 && windowSeconds > 3600) {
+    return `${windowSeconds / 3600} hours`;
+  }
+  if (windowSeconds === 60) return 'min';
+  if (windowSeconds % 60 === 0) {
+    return `${windowSeconds / 60} min`;
+  }
+  return `${windowSeconds}s`;
+}
+
+function computeRetryAfterSeconds(windowStart: number, windowMs: number, now: number): number {
+  const maxWaitSeconds = Math.max(1, Math.ceil(windowMs / 1000));
+  const remainingSeconds = Math.ceil((windowStart + windowMs - now) / 1000);
+  return Math.min(maxWaitSeconds, Math.max(1, remainingSeconds));
+}
+
 export function getClientIp(request: Request): string {
   const cfIp = request.headers.get('CF-Connecting-IP');
   if (cfIp) return cfIp.trim();
@@ -41,11 +95,10 @@ export async function checkRateLimit(params: {
   }
 
   if (existing.count >= limit) {
-    const retryAfterSeconds = Math.max(1, Math.ceil((existing.window_start + windowMs - now) / 1000));
     return {
       allowed: false,
       remaining: 0,
-      retryAfterSeconds,
+      retryAfterSeconds: computeRetryAfterSeconds(existing.window_start, windowMs, now),
     };
   }
 
@@ -83,7 +136,7 @@ export async function isRateLimited(params: {
   if (existing.count >= limit) {
     return {
       limited: true,
-      retryAfterSeconds: Math.max(1, Math.ceil((existing.window_start + windowMs - now) / 1000)),
+      retryAfterSeconds: computeRetryAfterSeconds(existing.window_start, windowMs, now),
     };
   }
   return { limited: false, retryAfterSeconds: 0 };

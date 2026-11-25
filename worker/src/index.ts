@@ -51,6 +51,9 @@ export function createApp() {
         'X-File-Category',
         'X-Turnstile-Token',
         'X-Delete-Token',
+        'X-Reserved-Id',
+        'X-Reserve-Token',
+        'X-Source-Id',
       ],
       credentials: true,
       maxAge: 86400,
@@ -81,6 +84,7 @@ export default {
           env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').bind(now),
           env.DB.prepare('DELETE FROM password_resets WHERE expires_at < ?').bind(now),
           env.DB.prepare('DELETE FROM rate_limits WHERE window_start < ?').bind(staleRateCutoff),
+          env.DB.prepare('DELETE FROM upload_reservations WHERE expires_at < ?').bind(now),
         ]);
       })()
     );

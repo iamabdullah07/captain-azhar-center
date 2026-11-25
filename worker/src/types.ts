@@ -11,6 +11,10 @@ export interface Env {
   FRONTEND_URL?: string;
   APP_NAME?: string;
   SAME_ORIGIN_COOKIES?: string;
+  UPLOAD_RATE_LIMIT_MAX?: string;
+  UPLOAD_RATE_LIMIT_WINDOW_SECONDS?: string;
+  WORD_CONVERTER_URL?: string;
+  WORD_CONVERTER_SECRET?: string;
 }
 
 export type ItemType = 'link' | 'image' | 'document' | 'video';

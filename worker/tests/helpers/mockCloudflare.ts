@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Env } from '../../src/types';
@@ -80,8 +80,13 @@ export function createMockR2(): R2Bucket & { store: Map<string, { bytes: Uint8Ar
 
 export function createMockD1(): D1Database {
   const sqlite = new DatabaseSync(':memory:');
-  const migrationSql = readFileSync(resolve(process.cwd(), 'migrations/0001_initial.sql'), 'utf8');
-  sqlite.exec(migrationSql);
+  const migrationsDir = resolve(process.cwd(), 'migrations');
+  const migrationFiles = readdirSync(migrationsDir)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+  for (const file of migrationFiles) {
+    sqlite.exec(readFileSync(resolve(migrationsDir, file), 'utf8'));
+  }
 
   const makeStmt = (sql: string, boundArgs: unknown[] = []) => {
     const stmt = sqlite.prepare(sql);

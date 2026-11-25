@@ -21,6 +21,18 @@ export interface CreatedQrRecord {
   createdAt: number;
 }
 
+export interface ApiCapabilities {
+  ok: boolean;
+  wordToPdfEnabled: boolean;
+}
+
+export interface ReservedShortId {
+  id: string;
+  shortUrl: string;
+  reserveToken: string;
+  expiresAt: number;
+}
+
 const MAX_NETWORK_RETRIES = 2;
 
 function sleep(ms: number): Promise<void> {
@@ -47,6 +59,37 @@ export function warmupApiConnection(): void {
   fetch(`${API_BASE_URL}/api/health`, { mode: 'cors' }).catch(() => {});
 }
 
+export async function fetchApiCapabilities(): Promise<ApiCapabilities> {
+  try {
+    const res = await fetchWithRetry(`${API_BASE_URL}/api/health`, { mode: 'cors' });
+    if (!res.ok) return { ok: false, wordToPdfEnabled: false };
+    const data = (await res.json()) as { ok?: boolean; wordToPdfEnabled?: boolean };
+    return {
+      ok: Boolean(data.ok),
+      wordToPdfEnabled: Boolean(data.wordToPdfEnabled),
+    };
+  } catch {
+    return { ok: false, wordToPdfEnabled: false };
+  }
+}
+
+export async function reserveShortId(params: {
+  sourceId?: string;
+  deleteToken?: string;
+  turnstileToken?: string;
+}): Promise<ReservedShortId> {
+  const res = await fetchWithRetry(`${API_BASE_URL}/api/upload/reserve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  const data = (await res.json().catch(() => ({}))) as ReservedShortId & { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || 'Could not allocate short link ID.');
+  }
+  return data;
+}
+
 export async function createShortLink(url: string, turnstileToken: string): Promise<CreatedQrRecord> {
   const res = await fetchWithRetry(`${API_BASE_URL}/api/link`, {
     method: 'POST',
@@ -64,9 +107,10 @@ function sendSingleUploadXhr(params: {
   file: File;
   category: Exclude<InputTab, 'link'>;
   turnstileToken: string;
+  reserved?: { id: string; reserveToken: string };
   onProgress: (pct: number) => void;
 }): Promise<CreatedQrRecord> {
-  const { file, category, turnstileToken, onProgress } = params;
+  const { file, category, turnstileToken, reserved, onProgress } = params;
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -76,6 +120,10 @@ function sendSingleUploadXhr(params: {
     xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
     xhr.setRequestHeader('X-File-Category', category);
     xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
+    if (reserved) {
+      xhr.setRequestHeader('X-Reserved-Id', reserved.id);
+      xhr.setRequestHeader('X-Reserve-Token', reserved.reserveToken);
+    }
 
     xhr.upload.onprogress = (ev) => {
       if (ev.lengthComputable && ev.total > 0) {
@@ -112,6 +160,7 @@ export async function uploadFileWithProgress(params: {
   file: File;
   category: Exclude<InputTab, 'link'>;
   turnstileToken: string;
+  reserved?: { id: string; reserveToken: string };
   onProgress: (pct: number) => void;
 }): Promise<CreatedQrRecord> {
   let lastErr: unknown;
@@ -129,6 +178,60 @@ export async function uploadFileWithProgress(params: {
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error('Network error while uploading file.');
+}
+
+export async function convertWordToPdf(params: {
+  file: File;
+  sourceId?: string;
+  deleteToken?: string;
+  turnstileToken?: string;
+  onProgress?: (pct: number) => void;
+}): Promise<Uint8Array> {
+  const { file, sourceId, deleteToken, turnstileToken = '', onProgress } = params;
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE_URL}/api/convert-word`, true);
+    xhr.responseType = 'arraybuffer';
+
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+    if (sourceId && deleteToken) {
+      xhr.setRequestHeader('X-Source-Id', sourceId);
+      xhr.setRequestHeader('X-Delete-Token', deleteToken);
+    } else {
+      xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
+    }
+
+    xhr.upload.onprogress = (ev) => {
+      if (onProgress && ev.lengthComputable && ev.total > 0) {
+        onProgress(Math.min(95, Math.round((ev.loaded / ev.total) * 100)));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response instanceof ArrayBuffer) {
+        onProgress?.(100);
+        resolve(new Uint8Array(xhr.response));
+        return;
+      }
+      let message = `Word conversion failed (${xhr.status})`;
+      if (xhr.response instanceof ArrayBuffer) {
+        try {
+          const text = new TextDecoder().decode(xhr.response);
+          const parsed = JSON.parse(text) as { error?: string };
+          if (parsed.error) message = parsed.error;
+        } catch {
+          // ignore parse error
+        }
+      }
+      reject(new Error(message));
+    };
+
+    xhr.onerror = () => reject(new Error('Network error while converting Word file.'));
+    xhr.onabort = () => reject(new Error('Word conversion was cancelled.'));
+    xhr.send(file);
+  });
 }
 
 export async function deleteUploadedItem(id: string, deleteToken: string): Promise<void> {

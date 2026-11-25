@@ -83,6 +83,46 @@ export function validateUrlInput(raw: string): { ok: true; url: string } | { ok:
   }
 }
 
+export type EditableDocKind = 'pdf' | 'word';
+
+export const EDITABLE_DOC_RULES = {
+  accept:
+    '.pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  extensions: ['pdf', 'doc', 'docx'] as const,
+  maxBytes: 25 * 1024 * 1024,
+  maxLabel: '25 MB',
+};
+
+export function detectEditableDocKind(filename: string): EditableDocKind | null {
+  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  if (ext === 'pdf') return 'pdf';
+  if (ext === 'doc' || ext === 'docx') return 'word';
+  return null;
+}
+
+export function validateEditableDocFile(
+  file: File
+): { ok: true; kind: EditableDocKind; ext: string } | { ok: false; error: string } {
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  const kind = detectEditableDocKind(file.name);
+  if (!kind) {
+    return {
+      ok: false,
+      error: 'Unsupported file type. Please choose a PDF, DOC, or DOCX document.',
+    };
+  }
+  if (file.size <= 0) {
+    return { ok: false, error: 'Selected file is empty.' };
+  }
+  if (file.size > EDITABLE_DOC_RULES.maxBytes) {
+    return {
+      ok: false,
+      error: `Document exceeds the ${EDITABLE_DOC_RULES.maxLabel} maximum size limit.`,
+    };
+  }
+  return { ok: true, kind, ext };
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
