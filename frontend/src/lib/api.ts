@@ -39,6 +39,40 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function xhrFallbackRequest(input: string, init: RequestInit): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const method = (init.method || 'GET').toUpperCase();
+    xhr.open(method, input, true);
+    xhr.withCredentials = init.credentials === 'include';
+
+    const headers = new Headers(init.headers);
+    headers.forEach((value, key) => {
+      xhr.setRequestHeader(key, value);
+    });
+
+    xhr.onload = () => {
+      const contentType = xhr.getResponseHeader('Content-Type') || 'application/json';
+      resolve(
+        new Response(xhr.responseText, {
+          status: xhr.status || 200,
+          statusText: xhr.statusText,
+          headers: { 'Content-Type': contentType },
+        })
+      );
+    };
+    xhr.onerror = () => {
+      reject(
+        new Error(
+          'Unable to reach the server. Please check your connection or disable any script/ad blocker and try again.'
+        )
+      );
+    };
+    xhr.onabort = () => reject(new Error('Request was cancelled.'));
+    xhr.send(typeof init.body === 'string' ? init.body : null);
+  });
+}
+
 async function fetchWithRetry(input: string, init: RequestInit): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= MAX_NETWORK_RETRIES; attempt++) {
@@ -47,9 +81,14 @@ async function fetchWithRetry(input: string, init: RequestInit): Promise<Respons
     } catch (err) {
       lastErr = err;
       if (attempt < MAX_NETWORK_RETRIES) {
+        // Trigger HTTP/2 fallback if QUIC dropped on the ISP before retrying
+        await fetch(`${API_BASE_URL}/api/health`, { mode: 'cors', cache: 'no-store' }).catch(() => {});
         await sleep(250 * (attempt + 1));
       }
     }
+  }
+  if (typeof XMLHttpRequest !== 'undefined' && (init.body === undefined || typeof init.body === 'string')) {
+    return await xhrFallbackRequest(input, init);
   }
   throw lastErr instanceof Error ? lastErr : new Error('Network error. Please try again.');
 }
