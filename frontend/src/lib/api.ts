@@ -21,8 +21,34 @@ export interface CreatedQrRecord {
   createdAt: number;
 }
 
+const MAX_NETWORK_RETRIES = 2;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(input: string, init: RequestInit): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= MAX_NETWORK_RETRIES; attempt++) {
+    try {
+      return await fetch(input, init);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_NETWORK_RETRIES) {
+        await sleep(250 * (attempt + 1));
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('Network error. Please try again.');
+}
+
+/** Silently warms the API connection (and triggers HTTP/2 fallback if QUIC is blocked on ISP). */
+export function warmupApiConnection(): void {
+  fetch(`${API_BASE_URL}/api/health`, { mode: 'cors' }).catch(() => {});
+}
+
 export async function createShortLink(url: string, turnstileToken: string): Promise<CreatedQrRecord> {
-  const res = await fetch(`${API_BASE_URL}/api/link`, {
+  const res = await fetchWithRetry(`${API_BASE_URL}/api/link`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url, turnstileToken }),
@@ -34,7 +60,7 @@ export async function createShortLink(url: string, turnstileToken: string): Prom
   return data;
 }
 
-export function uploadFileWithProgress(params: {
+function sendSingleUploadXhr(params: {
   file: File;
   category: Exclude<InputTab, 'link'>;
   turnstileToken: string;
@@ -71,15 +97,42 @@ export function uploadFileWithProgress(params: {
       }
     };
 
-    xhr.onerror = () => reject(new Error('Network error while uploading file.'));
+    xhr.onerror = () => {
+      const err = new Error('Network error while uploading file.');
+      (err as Error & { isTransientNetwork?: boolean }).isTransientNetwork = true;
+      reject(err);
+    };
     xhr.onabort = () => reject(new Error('Upload was cancelled.'));
 
     xhr.send(file);
   });
 }
 
+export async function uploadFileWithProgress(params: {
+  file: File;
+  category: Exclude<InputTab, 'link'>;
+  turnstileToken: string;
+  onProgress: (pct: number) => void;
+}): Promise<CreatedQrRecord> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= MAX_NETWORK_RETRIES; attempt++) {
+    try {
+      return await sendSingleUploadXhr(params);
+    } catch (err) {
+      lastErr = err;
+      const isTransient = Boolean((err as Error & { isTransientNetwork?: boolean })?.isTransientNetwork);
+      if (!isTransient || attempt >= MAX_NETWORK_RETRIES) {
+        throw err;
+      }
+      params.onProgress(0);
+      await sleep(250 * (attempt + 1));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('Network error while uploading file.');
+}
+
 export async function deleteUploadedItem(id: string, deleteToken: string): Promise<void> {
-  const res = await fetch(`${API_BASE_URL}/api/f/${encodeURIComponent(id)}`, {
+  const res = await fetchWithRetry(`${API_BASE_URL}/api/f/${encodeURIComponent(id)}`, {
     method: 'DELETE',
     headers: {
       'Content-Type': 'application/json',
@@ -94,7 +147,7 @@ export async function deleteUploadedItem(id: string, deleteToken: string): Promi
 }
 
 export async function submitAbuseReport(idOrUrl: string, reason: string): Promise<string> {
-  const res = await fetch(`${API_BASE_URL}/api/report`, {
+  const res = await fetchWithRetry(`${API_BASE_URL}/api/report`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ idOrUrl, reason }),
@@ -118,7 +171,7 @@ async function adminFetch<T>(path: string, options: RequestInit = {}): Promise<T
     headers.set('X-Requested-With', CSRF_HEADER_VALUE);
   }
 
-  const res = await fetch(`${API_BASE_URL}/api/admin${path}`, {
+  const res = await fetchWithRetry(`${API_BASE_URL}/api/admin${path}`, {
     ...options,
     credentials: 'include',
     headers,

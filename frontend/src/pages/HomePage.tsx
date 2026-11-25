@@ -18,6 +18,7 @@ import {
   deleteUploadedItem,
   TURNSTILE_SITE_KEY,
   uploadFileWithProgress,
+  warmupApiConnection,
   type CreatedQrRecord,
 } from '../lib/api';
 import {
@@ -83,6 +84,11 @@ export function HomePage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const contrast = useMemo(() => evaluateQrContrast(fgColor, bgColor), [fgColor, bgColor]);
+
+  // Warm API connection on mount so HTTP/2 fallback settles before user uploads
+  useEffect(() => {
+    warmupApiConnection();
+  }, []);
 
   // Live re-render of QR preview & download presets when customization changes for an active generated record
   useEffect(() => {

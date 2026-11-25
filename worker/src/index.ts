@@ -8,14 +8,34 @@ import { maybeSendStorageAlert, runStorageCleanup } from './services/cleanup';
 export function createApp() {
   const app = new Hono<{ Bindings: Env }>();
 
-  // Global security headers
+  // Global security headers + clear cached QUIC Alt-Svc hints where honored
   app.use('*', async (c, next) => {
     await next();
     c.header('X-Content-Type-Options', 'nosniff');
     c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+    c.header('Alt-Svc', 'clear');
     if (!c.req.path.startsWith('/f/')) {
       c.header('X-Frame-Options', 'DENY');
     }
+  });
+
+  // Ensure unexpected errors on /api/* still return CORS headers and JSON
+  app.onError((err, c) => {
+    console.error('Unhandled Worker error:', err instanceof Error ? err.message : err);
+    const headers = new Headers({ 'Content-Type': 'application/json' });
+    const origin = c.req.header('Origin');
+    if (origin && c.req.path.startsWith('/api/')) {
+      const allowed = parseAllowedOrigins(c.env, c.req.url);
+      if (allowed.includes(origin)) {
+        headers.set('Access-Control-Allow-Origin', origin);
+        headers.set('Access-Control-Allow-Credentials', 'true');
+        headers.set('Vary', 'Origin');
+      }
+    }
+    return new Response(JSON.stringify({ error: 'Internal server error. Please try again.' }), {
+      status: 500,
+      headers,
+    });
   });
 
   // Strict CORS on /api/* allowing only GitHub Pages (and localhost during local dev)
