@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AdminUserRow, CleanupLogRow, Env, LinkFileRow, ReportRow } from '../types';
+import { GEMINI_MODEL_CONFIG } from '../config/geminiModels';
 import {
   constantTimeEqualStr,
   createSessionToken,
@@ -19,6 +20,13 @@ import {
   runStorageCleanup,
   STORAGE_LIMIT_BYTES,
 } from '../services/cleanup';
+import {
+  encryptGeminiApiKey,
+  getExtractSettings,
+  listMaskedKeysForAdmin,
+  maskGeminiApiKey,
+  validateGeminiApiKeyFormat,
+} from '../services/geminiKeys';
 
 const SESSION_COOKIE_NAME = 'ck_admin_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -744,6 +752,173 @@ export function createAdminRoutes() {
       .run();
 
     return c.json({ ok: true, triggerPct, targetPct, expireLinksMonths });
+  });
+
+  // ---- Gemini API Keys & Extraction Settings (never exposes raw keys) ----
+  app.get('/extract-settings', async (c) => {
+    const settings = await getExtractSettings(c.env);
+    const keyInfo = await listMaskedKeysForAdmin(c.env);
+    return c.json({
+      maxPdfMb: settings.max_pdf_mb,
+      concurrency: settings.concurrency,
+      inlineThresholdMb: settings.inline_threshold_mb,
+      maxKeysLimit: GEMINI_MODEL_CONFIG.maxApiKeys,
+      envKeysCount: keyInfo.envKeysCount,
+      totalConfiguredCount: keyInfo.totalConfiguredCount,
+      keys: keyInfo.keys,
+    });
+  });
+
+  app.patch('/extract-settings', async (c) => {
+    let body: { maxPdfMb?: number; concurrency?: number; inlineThresholdMb?: number };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const current = await getExtractSettings(c.env);
+    const maxPdfMb = body.maxPdfMb ?? current.max_pdf_mb;
+    const concurrency = body.concurrency ?? current.concurrency;
+    const inlineThresholdMb = body.inlineThresholdMb ?? current.inline_threshold_mb;
+
+    if (!Number.isInteger(maxPdfMb) || maxPdfMb < 5 || maxPdfMb > 50) {
+      return c.json({ error: 'Max PDF size must be an integer between 5 MB and 50 MB.' }, 400);
+    }
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) {
+      return c.json({ error: 'Concurrency must be an integer between 1 and 20.' }, 400);
+    }
+    if (!Number.isInteger(inlineThresholdMb) || inlineThresholdMb < 1 || inlineThresholdMb > 15) {
+      return c.json({ error: 'Inline threshold must be an integer between 1 MB and 15 MB.' }, 400);
+    }
+
+    await c.env.DB
+      .prepare(
+        `UPDATE extract_settings
+         SET max_pdf_mb = ?, concurrency = ?, inline_threshold_mb = ?
+         WHERE id = 1`
+      )
+      .bind(maxPdfMb, concurrency, inlineThresholdMb)
+      .run();
+
+    return c.json({ ok: true, maxPdfMb, concurrency, inlineThresholdMb });
+  });
+
+  app.post('/gemini-keys', async (c) => {
+    const secret = (c.env.SESSION_SECRET ?? '').trim();
+    if (!secret) {
+      return c.json({ error: 'Server SESSION_SECRET is not configured for encrypting keys.' }, 500);
+    }
+
+    let body: { apiKey?: string; label?: string };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const check = validateGeminiApiKeyFormat(body.apiKey ?? '');
+    if (!check.ok) {
+      return c.json({ error: check.error }, 400);
+    }
+
+    const keyInfo = await listMaskedKeysForAdmin(c.env);
+    if (keyInfo.keys.length >= GEMINI_MODEL_CONFIG.maxApiKeys) {
+      return c.json(
+        { error: `Maximum ${GEMINI_MODEL_CONFIG.maxApiKeys} Gemini API keys are allowed.` },
+        400
+      );
+    }
+
+    const keyHash = await sha256Hex(check.cleaned);
+    const existing = await c.env.DB
+      .prepare('SELECT id FROM gemini_api_keys WHERE key_hash = ?')
+      .bind(keyHash)
+      .first<{ id: string }>();
+    if (existing) {
+      return c.json({ error: 'This Gemini API key is already added.' }, 409);
+    }
+
+    const id = crypto.randomUUID();
+    const maskedKey = maskGeminiApiKey(check.cleaned);
+    const encryptedKey = await encryptGeminiApiKey(check.cleaned, secret);
+    const label = (body.label ?? '').trim().slice(0, 60) || `Key ${keyInfo.keys.length + 1}`;
+    const now = Date.now();
+
+    await c.env.DB
+      .prepare(
+        `INSERT INTO gemini_api_keys
+         (id, label, encrypted_key, masked_key, key_hash, enabled, cooldown_until, last_used_at, success_count, error_count, last_error, created_at)
+         VALUES (?, ?, ?, ?, ?, 1, 0, 0, 0, 0, NULL, ?)`
+      )
+      .bind(id, label, encryptedKey, maskedKey, keyHash, now)
+      .run();
+
+    return c.json(
+      {
+        ok: true,
+        key: {
+          id,
+          source: 'db' as const,
+          label,
+          maskedKey,
+          enabled: true,
+          cooldownUntil: 0,
+          lastUsedAt: 0,
+          successCount: 0,
+          errorCount: 0,
+          lastError: null,
+          createdAt: now,
+        },
+      },
+      201
+    );
+  });
+
+  app.patch('/gemini-keys/:id', async (c) => {
+    const id = c.req.param('id').trim();
+    let body: { enabled?: boolean; label?: string; clearCooldown?: boolean };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const existing = await c.env.DB
+      .prepare('SELECT id, label, enabled, cooldown_until FROM gemini_api_keys WHERE id = ?')
+      .bind(id)
+      .first<{ id: string; label: string | null; enabled: number; cooldown_until: number }>();
+
+    if (!existing) {
+      return c.json({ error: 'API key not found.' }, 404);
+    }
+
+    const nextEnabled = body.enabled === undefined ? existing.enabled : body.enabled ? 1 : 0;
+    const nextLabel =
+      body.label === undefined ? existing.label : body.label.trim().slice(0, 60) || existing.label;
+    const nextCooldown = body.clearCooldown ? 0 : existing.cooldown_until;
+
+    await c.env.DB
+      .prepare(
+        'UPDATE gemini_api_keys SET enabled = ?, label = ?, cooldown_until = ? WHERE id = ?'
+      )
+      .bind(nextEnabled, nextLabel, nextCooldown, id)
+      .run();
+
+    return c.json({ ok: true, id, enabled: nextEnabled === 1, label: nextLabel });
+  });
+
+  app.delete('/gemini-keys/:id', async (c) => {
+    const id = c.req.param('id').trim();
+    const res = await c.env.DB
+      .prepare('DELETE FROM gemini_api_keys WHERE id = ?')
+      .bind(id)
+      .run();
+
+    if (!res.meta.changes) {
+      return c.json({ error: 'API key not found.' }, 404);
+    }
+    return c.json({ ok: true, id });
   });
 
   return app;

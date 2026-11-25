@@ -439,4 +439,241 @@ export const adminApi = {
       method: 'PATCH',
       body: JSON.stringify(payload),
     }),
+  getExtractSettings: () =>
+    adminFetch<{
+      maxPdfMb: number;
+      concurrency: number;
+      inlineThresholdMb: number;
+      maxKeysLimit: number;
+      envKeysCount: number;
+      totalConfiguredCount: number;
+      keys: AdminGeminiKeySummary[];
+    }>('/extract-settings'),
+  updateExtractSettings: (payload: {
+    maxPdfMb?: number;
+    concurrency?: number;
+    inlineThresholdMb?: number;
+  }) =>
+    adminFetch<{
+      ok: boolean;
+      maxPdfMb: number;
+      concurrency: number;
+      inlineThresholdMb: number;
+    }>('/extract-settings', {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  addGeminiKey: (apiKey: string, label?: string) =>
+    adminFetch<{ ok: boolean; key: AdminGeminiKeySummary }>('/gemini-keys', {
+      method: 'POST',
+      body: JSON.stringify({ apiKey, label }),
+    }),
+  updateGeminiKey: (
+    id: string,
+    payload: { enabled?: boolean; label?: string; clearCooldown?: boolean }
+  ) =>
+    adminFetch<{ ok: boolean; id: string; enabled: boolean; label: string }>(
+      `/gemini-keys/${encodeURIComponent(id)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      }
+    ),
+  deleteGeminiKey: (id: string) =>
+    adminFetch<{ ok: boolean; id: string }>(`/gemini-keys/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+};
+
+// ---- All Files Data (AI Extraction) API Client ----
+
+export type ExtractedIdType = 'passport' | 'iqama' | 'national_id' | 'visa';
+
+export interface GeminiModelOption {
+  id: string;
+  label: string;
+  priority: number;
+  description: string;
+}
+
+export interface ExtractConfigResponse {
+  ok: boolean;
+  maxPdfMb: number;
+  concurrency: number;
+  effectiveConcurrency: number;
+  inlineThresholdMb: number;
+  activeKeyCount: number;
+  wordToPdfEnabled: boolean;
+  models: GeminiModelOption[];
+}
+
+export interface IngestedExtractItem {
+  fileId: string;
+  accessToken: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  kind: 'image' | 'pdf' | 'text';
+  sourceArchive?: string;
+}
+
+export interface IngestExtractResponse {
+  ok: boolean;
+  items: IngestedExtractItem[];
+  skipped: Array<{ fileName: string; reason: string }>;
+  error?: string;
+}
+
+export interface ExtractedDocumentRecord {
+  pageNumber: number | null;
+  name: string | null;
+  idNumber: string | null;
+  idType: ExtractedIdType | null;
+  nationality: string | null;
+  confidence: number | null;
+}
+
+export interface RunExtractResponse {
+  ok: boolean;
+  fileId: string;
+  modelUsed: string;
+  durationMs: number;
+  documents: ExtractedDocumentRecord[];
+  attempts: Array<{ model: string; status: 'ok' | 'retry' | 'failed'; reason?: string }>;
+  error?: string;
+}
+
+export interface AdminGeminiKeySummary {
+  id: string;
+  source: 'db' | 'env';
+  label: string;
+  maskedKey: string;
+  enabled: boolean;
+  cooldownUntil: number;
+  lastUsedAt: number;
+  successCount: number;
+  errorCount: number;
+  lastError: string | null;
+  createdAt: number;
+}
+
+export const extractApi = {
+  getConfig: async (): Promise<ExtractConfigResponse> => {
+    const res = await fetchWithRetry(`${API_BASE_URL}/api/extract/config`, { mode: 'cors' });
+    const data = (await res.json().catch(() => ({}))) as ExtractConfigResponse & { error?: string };
+    if (!res.ok) {
+      throw new Error(data.error || 'Could not load extraction configuration.');
+    }
+    return data;
+  },
+
+  createSession: async (turnstileToken: string): Promise<string> => {
+    const res = await fetchWithRetry(`${API_BASE_URL}/api/extract/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnstileToken }),
+    });
+    const data = (await res.json().catch(() => ({}))) as { batchTicket?: string; error?: string };
+    if (!res.ok || !data.batchTicket) {
+      throw new Error(data.error || 'Security verification failed.');
+    }
+    return data.batchTicket;
+  },
+
+  ingestFileWithProgress: (params: {
+    file: File;
+    turnstileToken?: string;
+    batchTicket?: string;
+    onProgress: (pct: number) => void;
+  }): Promise<IngestExtractResponse> => {
+    const { file, turnstileToken = '', batchTicket = '', onProgress } = params;
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API_BASE_URL}/api/extract/ingest`, true);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+      if (batchTicket) {
+        xhr.setRequestHeader('X-Extract-Batch-Token', batchTicket);
+      } else if (turnstileToken) {
+        xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
+      }
+
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && ev.total > 0) {
+          onProgress(Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
+        }
+      };
+
+      xhr.onload = () => {
+        try {
+          const parsed = JSON.parse(xhr.responseText || '{}') as IngestExtractResponse;
+          if (xhr.status >= 200 && xhr.status < 300) {
+            onProgress(100);
+            resolve(parsed);
+          } else {
+            reject(new Error(parsed.error || `Upload failed (${xhr.status})`));
+          }
+        } catch {
+          reject(new Error(`Upload failed (${xhr.status})`));
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('Network error while uploading file.'));
+      xhr.onabort = () => reject(new Error('Upload was cancelled.'));
+      xhr.send(file);
+    });
+  },
+
+  runExtraction: async (params: {
+    fileId: string;
+    accessToken: string;
+    model: string;
+    allowFallback: boolean;
+    excludeModels?: string[];
+  }): Promise<RunExtractResponse> => {
+    const res = await fetchWithRetry(`${API_BASE_URL}/api/extract/run`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Extract-Token': params.accessToken,
+      },
+      body: JSON.stringify({
+        fileId: params.fileId,
+        model: params.model,
+        allowFallback: params.allowFallback,
+        excludeModels: params.excludeModels ?? [],
+      }),
+    });
+    const data = (await res.json().catch(() => ({}))) as RunExtractResponse;
+    if (!res.ok) {
+      throw new Error(data.error || `Extraction failed (${res.status})`);
+    }
+    return data;
+  },
+
+  fetchFileBlob: async (fileId: string, accessToken: string): Promise<Blob> => {
+    const res = await fetchWithRetry(`${API_BASE_URL}/api/extract/file/${encodeURIComponent(fileId)}`, {
+      method: 'GET',
+      headers: {
+        'X-Extract-Token': accessToken,
+      },
+    });
+    if (!res.ok) {
+      throw new Error(`Preview failed (${res.status})`);
+    }
+    return await res.blob();
+  },
+
+  deleteFile: async (fileId: string, accessToken: string): Promise<void> => {
+    const res = await fetchWithRetry(`${API_BASE_URL}/api/extract/file/${encodeURIComponent(fileId)}`, {
+      method: 'DELETE',
+      headers: {
+        'X-Extract-Token': accessToken,
+      },
+    });
+    if (!res.ok && res.status !== 404 && res.status !== 410) {
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(data.error || 'Could not delete file.');
+    }
+  },
 };

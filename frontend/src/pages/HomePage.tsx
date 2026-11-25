@@ -8,6 +8,7 @@ import {
   Info,
   Link2,
   QrCode,
+  ScanText,
   Upload,
   X,
 } from 'lucide-react';
@@ -15,6 +16,9 @@ import { FeatureCards } from '../components/FeatureCards';
 
 const DocumentQrEditor = lazy(() =>
   import('../components/DocumentQrEditor').then((m) => ({ default: m.DocumentQrEditor }))
+);
+const AllFilesDataSection = lazy(() =>
+  import('../components/AllFilesDataSection').then((m) => ({ default: m.AllFilesDataSection }))
 );
 import { QRPreview } from '../components/QRPreview';
 import { TurnstileBox } from '../components/TurnstileBox';
@@ -64,7 +68,9 @@ function saveRecentRecord(record: CreatedQrRecord) {
 }
 
 export function HomePage() {
-  const [homeSection, setHomeSection] = useState<'generate' | 'edit-file'>('generate');
+  const [homeSection, setHomeSection] = useState<'generate' | 'edit-file' | 'extract-data'>(
+    'generate'
+  );
   const [activeTab, setActiveTab] = useState<InputTab>('link');
   const [urlInput, setUrlInput] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -274,40 +280,54 @@ export function HomePage() {
           </span>
         </div>
 
-        {/* Two Top-Level Workspace Sections (Red Box 1: Generate QR, Red Box 2: Edit QR in File) */}
+        {/* Three Top-Level Workspace Sections: Generate QR, Edit QR in File, Extract Data */}
         <div className="mt-7 flex justify-center">
           <div
             role="tablist"
             aria-label="Service sections"
-            className="inline-grid grid-cols-2 gap-1.5 bg-white border border-slate-200/90 shadow-sm p-1.5 rounded-2xl w-full max-w-md"
+            className="inline-grid grid-cols-3 gap-1.5 bg-white border border-slate-200/90 shadow-sm p-1.5 rounded-2xl w-full max-w-xl"
           >
             <button
               type="button"
               role="tab"
               aria-selected={homeSection === 'generate'}
               onClick={() => setHomeSection('generate')}
-              className={`flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
+              className={`flex items-center justify-center gap-2 py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
                 homeSection === 'generate'
                   ? 'bg-[#0A1832] text-[#D9A441] shadow-sm'
                   : 'text-slate-600 hover:text-[#0A1832] hover:bg-slate-50'
               }`}
             >
               <QrCode className="w-4 h-4 shrink-0" />
-              <span>Generate QR</span>
+              <span className="truncate">Generate QR</span>
             </button>
             <button
               type="button"
               role="tab"
               aria-selected={homeSection === 'edit-file'}
               onClick={() => setHomeSection('edit-file')}
-              className={`flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
+              className={`flex items-center justify-center gap-2 py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
                 homeSection === 'edit-file'
                   ? 'bg-[#0A1832] text-[#D9A441] shadow-sm'
                   : 'text-slate-600 hover:text-[#0A1832] hover:bg-slate-50'
               }`}
             >
               <FilePenLine className="w-4 h-4 shrink-0" />
-              <span>Edit QR in File</span>
+              <span className="truncate">Edit QR in File</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={homeSection === 'extract-data'}
+              onClick={() => setHomeSection('extract-data')}
+              className={`flex items-center justify-center gap-2 py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
+                homeSection === 'extract-data'
+                  ? 'bg-[#0A1832] text-[#D9A441] shadow-sm'
+                  : 'text-slate-600 hover:text-[#0A1832] hover:bg-slate-50'
+              }`}
+            >
+              <ScanText className="w-4 h-4 shrink-0" />
+              <span className="truncate">Extract Data</span>
             </button>
           </div>
         </div>
@@ -651,7 +671,7 @@ export function HomePage() {
           </div>
         </div>
       </section>
-      ) : (
+      ) : homeSection === 'edit-file' ? (
         <Suspense
           fallback={
             <div className="max-w-3xl mx-auto px-4 py-12 text-center text-sm text-slate-500">
@@ -660,6 +680,16 @@ export function HomePage() {
           }
         >
           <DocumentQrEditor />
+        </Suspense>
+      ) : (
+        <Suspense
+          fallback={
+            <div className="max-w-3xl mx-auto px-4 py-12 text-center text-sm text-slate-500">
+              Loading AI data extractor...
+            </div>
+          }
+        >
+          <AllFilesDataSection />
         </Suspense>
       )}
 

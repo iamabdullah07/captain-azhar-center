@@ -3,7 +3,12 @@ import { cors } from 'hono/cors';
 import type { Env } from './types';
 import { createPublicRoutes } from './routes/public';
 import { createAdminRoutes, parseAllowedOrigins } from './routes/admin';
-import { maybeSendStorageAlert, runStorageCleanup } from './services/cleanup';
+import { createExtractRoutes } from './routes/extract';
+import {
+  cleanupExpiredExtractionFiles,
+  maybeSendStorageAlert,
+  runStorageCleanup,
+} from './services/cleanup';
 
 export function createApp() {
   const app = new Hono<{ Bindings: Env }>();
@@ -56,6 +61,8 @@ export function createApp() {
         'X-Reserve-Next',
         'X-Source-Id',
         'X-Converted-Upload-Ticket',
+        'X-Extract-Token',
+        'X-Extract-Batch-Token',
       ],
       exposeHeaders: ['X-Converted-Upload-Ticket'],
       credentials: true,
@@ -66,6 +73,7 @@ export function createApp() {
 
   app.route('/', createPublicRoutes());
   app.route('/api/admin', createAdminRoutes());
+  app.route('/api/extract', createExtractRoutes());
 
   return app;
 }
@@ -78,6 +86,7 @@ export default {
     const now = Date.now();
     ctx.waitUntil(
       (async () => {
+        await cleanupExpiredExtractionFiles(env, now);
         await runStorageCleanup({ env, trigger: 'daily', now });
         await maybeSendStorageAlert(env, now);
 

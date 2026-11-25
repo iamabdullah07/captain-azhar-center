@@ -2,6 +2,8 @@
 ADMIN_EMAIL=owner@example.com
 SESSION_SECRET=dev-only-replace-with-64-char-random-hex-secret-before-production-use
 EMAIL_API_KEY=re_your_resend_or_brevo_api_key
-TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+TURNSTILE_SECRET_KEY=1x00000000000000000000AA
 ALLOWED_ORIGINS=http://localhost:5173
 FRONTEND_URL=http://localhost:5173
+# Optional comma-separated Gemini API keys for All Files Data extraction (or manage via #/admin)
+GEMINI_API_KEYS=

@@ -241,3 +241,43 @@ export async function maybeSendStorageAlert(env: Env, now = Date.now()): Promise
   }
   return sent;
 }
+
+/**
+ * Deletes expired temporary files created by the AI extraction section (`ALL FILES DATA`)
+ * and reclaims their R2 storage quota.
+ */
+export async function cleanupExpiredExtractionFiles(env: Env, now = Date.now()): Promise<number> {
+  const expired = await env.DB
+    .prepare(
+      `SELECT id, r2_key, size_bytes
+       FROM extraction_files
+       WHERE status = 'active' AND expires_at <= ?
+       LIMIT 100`
+    )
+    .bind(now)
+    .all<{ id: string; r2_key: string; size_bytes: number }>();
+
+  const rows = expired.results ?? [];
+  if (rows.length === 0) return 0;
+
+  let freed = 0;
+  const stmts: D1PreparedStatement[] = [];
+  for (const row of rows) {
+    await env.FILES.delete(row.r2_key).catch(() => {});
+    stmts.push(
+      env.DB.prepare("UPDATE extraction_files SET status = 'removed' WHERE id = ?").bind(row.id)
+    );
+    freed += row.size_bytes;
+  }
+
+  if (freed > 0) {
+    stmts.push(
+      env.DB
+        .prepare('UPDATE storage_stats SET total_bytes = MAX(0, total_bytes - ?) WHERE id = 1')
+        .bind(freed)
+    );
+  }
+
+  await env.DB.batch(stmts);
+  return rows.length;
+}

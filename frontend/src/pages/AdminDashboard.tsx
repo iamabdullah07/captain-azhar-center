@@ -14,6 +14,7 @@ import {
   Settings,
   Trash2,
 } from 'lucide-react';
+import { AdminGeminiSettings } from '../components/AdminGeminiSettings';
 import { adminApi } from '../lib/api';
 import { formatBytes } from '../lib/fileCheck';
 
@@ -22,7 +23,7 @@ interface AdminDashboardProps {
   onLoggedOut: () => void;
 }
 
-type DashboardTab = 'files' | 'reports' | 'logs' | 'settings';
+type DashboardTab = 'files' | 'reports' | 'logs' | 'gemini' | 'settings';
 
 export function AdminDashboard({ ownerEmail, onLoggedOut }: AdminDashboardProps) {
   const [tab, setTab] = useState<DashboardTab>('files');
@@ -275,6 +276,7 @@ export function AdminDashboard({ ownerEmail, onLoggedOut }: AdminDashboardProps)
             ['files', 'Files & Links'],
             ['reports', `Abuse Reports (${stats?.unresolvedReportsCount ?? 0})`],
             ['logs', 'Cleanup & Login Logs'],
+            ['gemini', 'Gemini AI Keys'],
             ['settings', 'Cleanup Settings'],
           ] as Array<[DashboardTab, string]>
         ).map(([id, label]) => (
@@ -563,7 +565,12 @@ export function AdminDashboard({ ownerEmail, onLoggedOut }: AdminDashboardProps)
         </div>
       )}
 
-      {/* Tab 4: Settings */}
+      {/* Tab 4: Gemini AI Keys & Extraction Settings */}
+      {tab === 'gemini' && (
+        <AdminGeminiSettings onNotice={setNotice} onError={setError} />
+      )}
+
+      {/* Tab 5: Settings */}
       {tab === 'settings' && (
         <form
           onSubmit={handleSaveSettings}

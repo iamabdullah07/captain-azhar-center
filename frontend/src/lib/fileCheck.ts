@@ -130,3 +130,51 @@ export function formatBytes(bytes: number): string {
   const val = bytes / Math.pow(1024, i);
   return `${val >= 10 || i === 0 ? val.toFixed(1) : val.toFixed(2)} ${units[i]}`;
 }
+
+export const EXTRACT_UPLOAD_RULES = {
+  accept:
+    '.jpg,.jpeg,.png,.webp,.heic,.heif,.pdf,.zip,.doc,.docx,image/jpeg,image/png,image/webp,image/heic,image/heif,application/pdf,application/zip,application/x-zip-compressed,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  extensions: ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'pdf', 'zip', 'docx', 'doc'] as const,
+  imageExtensions: ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'] as const,
+  maxImageBytes: 20 * 1024 * 1024,
+  maxDocBytes: 25 * 1024 * 1024,
+} as const;
+
+export function validateExtractFile(
+  file: File,
+  maxPdfMb = 50
+): { ok: true; ext: string } | { ok: false; error: string } {
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  if (!ext || !(EXTRACT_UPLOAD_RULES.extensions as readonly string[]).includes(ext)) {
+    return {
+      ok: false,
+      error: `Unsupported file type "${file.name}". Allowed: JPG, JPEG, PNG, WEBP, HEIC, PDF, ZIP, DOCX.`,
+    };
+  }
+  if (file.size <= 0) {
+    return { ok: false, error: `"${file.name}" is empty.` };
+  }
+
+  const maxPdfBytes = Math.max(5, maxPdfMb) * 1024 * 1024;
+  if ((EXTRACT_UPLOAD_RULES.imageExtensions as readonly string[]).includes(ext)) {
+    if (file.size > EXTRACT_UPLOAD_RULES.maxImageBytes) {
+      return { ok: false, error: `"${file.name}" exceeds the 20 MB image size limit.` };
+    }
+    return { ok: true, ext };
+  }
+
+  if (ext === 'doc' || ext === 'docx') {
+    if (file.size > EXTRACT_UPLOAD_RULES.maxDocBytes) {
+      return { ok: false, error: `"${file.name}" exceeds the 25 MB document size limit.` };
+    }
+    return { ok: true, ext };
+  }
+
+  if (file.size > maxPdfBytes) {
+    return {
+      ok: false,
+      error: `"${file.name}" exceeds the configured ${maxPdfMb} MB limit.`,
+    };
+  }
+  return { ok: true, ext };
+}

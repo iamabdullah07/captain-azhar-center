@@ -15,6 +15,10 @@ export interface Env {
   UPLOAD_RATE_LIMIT_WINDOW_SECONDS?: string;
   WORD_CONVERTER_URL?: string;
   WORD_CONVERTER_SECRET?: string;
+  GEMINI_API_KEY?: string;
+  GEMINI_API_KEYS?: string;
+  EXTRACT_MAX_PDF_MB?: string;
+  EXTRACT_CONCURRENCY?: string;
 }
 
 export type ItemType = 'link' | 'image' | 'document' | 'video';
@@ -67,4 +71,48 @@ export interface ReportRow {
   reason: string;
   time: number;
   resolved: number;
+}
+
+export interface GeminiApiKeyRow {
+  id: string;
+  label: string | null;
+  encrypted_key: string;
+  masked_key: string;
+  key_hash: string;
+  enabled: number;
+  cooldown_until: number;
+  last_used_at: number;
+  success_count: number;
+  error_count: number;
+  last_error: string | null;
+  created_at: number;
+}
+
+export interface GeminiKeyRuntimeRow {
+  key_hash: string;
+  cooldown_until: number;
+  last_used_at: number;
+  success_count: number;
+  error_count: number;
+  last_error: string | null;
+}
+
+export interface ExtractSettingsRow {
+  id: number;
+  max_pdf_mb: number;
+  concurrency: number;
+  inline_threshold_mb: number;
+  key_rr_cursor: number;
+}
+
+export interface ExtractionFileRow {
+  id: string;
+  r2_key: string;
+  original_name: string;
+  mime_type: string;
+  size_bytes: number;
+  access_token_hash: string;
+  created_at: number;
+  expires_at: number;
+  status: 'active' | 'removed';
 }
