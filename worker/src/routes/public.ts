@@ -760,6 +760,30 @@ export function createPublicRoutes() {
     // Optional background 70% alert email
     runInBackground(c, maybeSendStorageAlert(c.env, now));
 
+    // Optionally pre-reserve the next short ID for DocumentQrEditor so Generate needs zero extra /reserve round-trips
+    let nextReservation:
+      | { id: string; shortUrl: string; reserveToken: string; expiresAt: number }
+      | undefined;
+    if (!reservedId && c.req.header('X-Reserve-Next') === '1') {
+      const nextId = await allocateUniqueId(c.env.DB, now);
+      const nextToken = generateRandomToken(32);
+      const nextTokenHash = await sha256Hex(nextToken);
+      const nextExpiresAt = now + RESERVATION_TTL_MS;
+      await c.env.DB
+        .prepare(
+          `INSERT INTO upload_reservations (id, token_hash, source_id, expires_at, used_at)
+           VALUES (?, ?, ?, ?, NULL)`
+        )
+        .bind(nextId, nextTokenHash, id, nextExpiresAt)
+        .run();
+      nextReservation = {
+        id: nextId,
+        shortUrl: buildShortUrl(c.req.url, nextId),
+        reserveToken: nextToken,
+        expiresAt: nextExpiresAt,
+      };
+    }
+
     return c.json(
       {
         id,
@@ -770,6 +794,7 @@ export function createPublicRoutes() {
         shortUrl: buildShortUrl(c.req.url, id),
         deleteToken,
         createdAt: now,
+        ...(nextReservation ? { nextReservation } : {}),
       },
       201
     );

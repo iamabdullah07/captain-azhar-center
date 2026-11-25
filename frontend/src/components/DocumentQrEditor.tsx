@@ -32,6 +32,7 @@ import {
   TURNSTILE_SITE_KEY,
   uploadFileWithProgress,
   type CreatedQrRecord,
+  type ReservedShortId,
 } from '../lib/api';
 import {
   EDITABLE_DOC_RULES,
@@ -89,6 +90,7 @@ export function DocumentQrEditor() {
 
   // Loaded editor session state
   const [originalRecord, setOriginalRecord] = useState<CreatedQrRecord | null>(null);
+  const [pendingReservation, setPendingReservation] = useState<ReservedShortId | null>(null);
   const [sourceKind, setSourceKind] = useState<EditableDocKind | null>(null);
   const [workingPdfBytes, setWorkingPdfBytes] = useState<Uint8Array | null>(null);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null);
@@ -152,6 +154,7 @@ export function DocumentQrEditor() {
       URL.revokeObjectURL(finalPdfUrl);
     }
     setOriginalRecord(null);
+    setPendingReservation(null);
     setSourceKind(null);
     setWorkingPdfBytes(null);
     setPdfDocument(null);
@@ -230,18 +233,22 @@ export function DocumentQrEditor() {
           file: selectedFile,
           category: 'document',
           turnstileToken,
+          reserveNext: true,
           onProgress: setUploadProgress,
         });
         setOriginalRecord(uploaded);
+        setPendingReservation(uploaded.nextReservation ?? null);
       } else {
         setPrepareStage('Uploading Word document...');
         const uploadedWord = await uploadFileWithProgress({
           file: selectedFile,
           category: 'document',
           turnstileToken,
+          reserveNext: true,
           onProgress: setUploadProgress,
         });
         setOriginalRecord(uploadedWord);
+        setPendingReservation(uploadedWord.nextReservation ?? null);
 
         setPrepareStage('Converting Word document to PDF...');
         setUploadProgress(0);
@@ -403,12 +410,19 @@ export function DocumentQrEditor() {
     setSaveProgress(0);
 
     try {
-      // 1. Reserve final short ID first so the QR embedded inside the PDF points to this exact final PDF
-      const reserved = await reserveShortId({
-        sourceId: originalRecord.id,
-        deleteToken: originalRecord.deleteToken,
-        turnstileToken,
-      });
+      // 1. Use pre-reserved short ID from upload (or allocate a fresh one on re-generate)
+      const hasValidPreReserved =
+        pendingReservation && pendingReservation.expiresAt > Date.now() + 30_000;
+      const reserved = hasValidPreReserved
+        ? pendingReservation
+        : await reserveShortId({
+            sourceId: originalRecord.id,
+            deleteToken: originalRecord.deleteToken,
+            turnstileToken,
+          });
+      if (hasValidPreReserved) {
+        setPendingReservation(null);
+      }
 
       // 2. Build & jsQR-verify high-res QR code with 4-module white panel
       const verifiedQr = generateVerifiedQr({

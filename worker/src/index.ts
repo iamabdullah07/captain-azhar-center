@@ -53,6 +53,7 @@ export function createApp() {
         'X-Delete-Token',
         'X-Reserved-Id',
         'X-Reserve-Token',
+        'X-Reserve-Next',
         'X-Source-Id',
       ],
       credentials: true,

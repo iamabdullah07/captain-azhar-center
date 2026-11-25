@@ -19,6 +19,7 @@ export interface CreatedQrRecord {
   targetUrl?: string;
   sizeBytes?: number;
   createdAt: number;
+  nextReservation?: ReservedShortId;
 }
 
 export interface ApiCapabilities {
@@ -33,13 +34,13 @@ export interface ReservedShortId {
   expiresAt: number;
 }
 
-const MAX_NETWORK_RETRIES = 2;
+const MAX_NETWORK_RETRIES = 3;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function xhrFallbackRequest(input: string, init: RequestInit): Promise<Response> {
+function sendSingleXhrRequest(input: string, init: RequestInit): Promise<Response> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const method = (init.method || 'GET').toUpperCase();
@@ -71,6 +72,24 @@ function xhrFallbackRequest(input: string, init: RequestInit): Promise<Response>
     xhr.onabort = () => reject(new Error('Request was cancelled.'));
     xhr.send(typeof init.body === 'string' ? init.body : null);
   });
+}
+
+async function xhrFallbackRequest(input: string, init: RequestInit): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await sendSingleXhrRequest(input, init);
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0) {
+        await fetch(`${API_BASE_URL}/api/health`, { mode: 'cors', cache: 'no-store' }).catch(() => {});
+        await sleep(350);
+      }
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error('Unable to reach the server. Please check your connection and try again.');
 }
 
 async function fetchWithRetry(input: string, init: RequestInit): Promise<Response> {
@@ -147,9 +166,10 @@ function sendSingleUploadXhr(params: {
   category: Exclude<InputTab, 'link'>;
   turnstileToken: string;
   reserved?: { id: string; reserveToken: string };
+  reserveNext?: boolean;
   onProgress: (pct: number) => void;
 }): Promise<CreatedQrRecord> {
-  const { file, category, turnstileToken, reserved, onProgress } = params;
+  const { file, category, turnstileToken, reserved, reserveNext, onProgress } = params;
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -159,6 +179,9 @@ function sendSingleUploadXhr(params: {
     xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
     xhr.setRequestHeader('X-File-Category', category);
     xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
+    if (reserveNext) {
+      xhr.setRequestHeader('X-Reserve-Next', '1');
+    }
     if (reserved) {
       xhr.setRequestHeader('X-Reserved-Id', reserved.id);
       xhr.setRequestHeader('X-Reserve-Token', reserved.reserveToken);
@@ -200,6 +223,7 @@ export async function uploadFileWithProgress(params: {
   category: Exclude<InputTab, 'link'>;
   turnstileToken: string;
   reserved?: { id: string; reserveToken: string };
+  reserveNext?: boolean;
   onProgress: (pct: number) => void;
 }): Promise<CreatedQrRecord> {
   let lastErr: unknown;
@@ -213,7 +237,8 @@ export async function uploadFileWithProgress(params: {
         throw err;
       }
       params.onProgress(0);
-      await sleep(250 * (attempt + 1));
+      await fetch(`${API_BASE_URL}/api/health`, { mode: 'cors', cache: 'no-store' }).catch(() => {});
+      await sleep(300 * (attempt + 1));
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error('Network error while uploading file.');

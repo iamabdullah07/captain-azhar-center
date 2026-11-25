@@ -1194,4 +1194,53 @@ describe('Public API & Security Verification (Part D7)', () => {
       fetchSpy.mockRestore();
     }
   });
+
+  it('pre-reserves next short ID inline when X-Reserve-Next: 1 is sent on initial upload', async () => {
+    const app = createApp();
+    const env = createTestEnv();
+
+    const origRes = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(PDF_BYTES.byteLength),
+          'X-File-Name': 'inline-orig.pdf',
+          'X-File-Category': 'document',
+          'X-Reserve-Next': '1',
+        },
+        body: PDF_BYTES,
+      },
+      env
+    );
+    expect(origRes.status).toBe(201);
+    const orig = (await origRes.json()) as {
+      id: string;
+      nextReservation?: { id: string; shortUrl: string; reserveToken: string; expiresAt: number };
+    };
+    expect(orig.nextReservation).toBeDefined();
+    expect(orig.nextReservation?.id).not.toBe(orig.id);
+
+    const finalRes = await app.request(
+      'https://worker.local/api/upload',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(PDF_BYTES.byteLength),
+          'X-File-Name': 'inline-final.pdf',
+          'X-File-Category': 'document',
+          'X-Reserved-Id': orig.nextReservation!.id,
+          'X-Reserve-Token': orig.nextReservation!.reserveToken,
+        },
+        body: PDF_BYTES,
+      },
+      env
+    );
+    expect(finalRes.status).toBe(201);
+    const fin = (await finalRes.json()) as { id: string; nextReservation?: unknown };
+    expect(fin.id).toBe(orig.nextReservation!.id);
+    expect(fin.nextReservation).toBeUndefined();
+  });
 });
