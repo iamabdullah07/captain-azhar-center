@@ -510,6 +510,7 @@ export interface PublicKeyQuotaSnapshot {
   tokensRemaining: number;
   remainingPct: number;
   requestsToday: number;
+  cooledDownModels?: string[];
 }
 
 export interface ExtractConfigResponse {
@@ -562,6 +563,23 @@ export interface RunExtractResponse {
   error?: string;
 }
 
+export interface RunBatchExtractResponse {
+  ok: boolean;
+  modelUsed: string;
+  durationMs: number;
+  tokenUsage?: { promptTokens: number; outputTokens: number; totalTokens: number };
+  quota?: PublicKeyQuotaSnapshot;
+  results: Array<{ fileId: string; documents: ExtractedDocumentRecord[] }>;
+  attempts: Array<{ model: string; status: 'ok' | 'retry' | 'failed'; reason?: string }>;
+  error?: string;
+}
+
+function buildExtractError(message: string, quota?: PublicKeyQuotaSnapshot): Error {
+  const err = new Error(message) as Error & { quota?: PublicKeyQuotaSnapshot };
+  if (quota) err.quota = quota;
+  return err;
+}
+
 export interface AdminGeminiKeySummary {
   id: string;
   source: 'db' | 'env';
@@ -608,41 +626,56 @@ export const extractApi = {
     onProgress: (pct: number) => void;
   }): Promise<IngestExtractResponse> => {
     const { file, turnstileToken = '', batchTicket = '', onProgress } = params;
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', `${API_BASE_URL}/api/extract/ingest`, true);
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-      xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
-      if (batchTicket) {
-        xhr.setRequestHeader('X-Extract-Batch-Token', batchTicket);
-      } else if (turnstileToken) {
-        xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
-      }
-
-      xhr.upload.onprogress = (ev) => {
-        if (ev.lengthComputable && ev.total > 0) {
-          onProgress(Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
+    const attemptUpload = (canRetry: boolean): Promise<IngestExtractResponse> =>
+      new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `${API_BASE_URL}/api/extract/ingest`, true);
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+        if (batchTicket) {
+          xhr.setRequestHeader('X-Extract-Batch-Token', batchTicket);
+        } else if (turnstileToken) {
+          xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
         }
-      };
 
-      xhr.onload = () => {
-        try {
-          const parsed = JSON.parse(xhr.responseText || '{}') as IngestExtractResponse;
-          if (xhr.status >= 200 && xhr.status < 300) {
-            onProgress(100);
-            resolve(parsed);
-          } else {
-            reject(new Error(parsed.error || `Upload failed (${xhr.status})`));
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable && ev.total > 0) {
+            onProgress(Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
           }
-        } catch {
-          reject(new Error(`Upload failed (${xhr.status})`));
-        }
-      };
+        };
 
-      xhr.onerror = () => reject(new Error('Network error while uploading file.'));
-      xhr.onabort = () => reject(new Error('Upload was cancelled.'));
-      xhr.send(file);
-    });
+        xhr.onload = () => {
+          try {
+            const parsed = JSON.parse(xhr.responseText || '{}') as IngestExtractResponse;
+            if (xhr.status >= 200 && xhr.status < 300) {
+              onProgress(100);
+              resolve(parsed);
+            } else if (canRetry && xhr.status >= 502 && xhr.status <= 504) {
+              setTimeout(() => void attemptUpload(false).then(resolve, reject), 450);
+            } else {
+              reject(new Error(parsed.error || `Upload failed (${xhr.status})`));
+            }
+          } catch {
+            if (canRetry && xhr.status >= 502 && xhr.status <= 504) {
+              setTimeout(() => void attemptUpload(false).then(resolve, reject), 450);
+            } else {
+              reject(new Error(`Upload failed (${xhr.status})`));
+            }
+          }
+        };
+
+        xhr.onerror = () => {
+          if (canRetry) {
+            setTimeout(() => void attemptUpload(false).then(resolve, reject), 450);
+          } else {
+            reject(new Error('Network error while uploading file.'));
+          }
+        };
+        xhr.onabort = () => reject(new Error('Upload was cancelled.'));
+        xhr.send(file);
+      });
+
+    return attemptUpload(true);
   },
 
   runExtraction: async (params: {
@@ -667,7 +700,32 @@ export const extractApi = {
     });
     const data = (await res.json().catch(() => ({}))) as RunExtractResponse;
     if (!res.ok) {
-      throw new Error(data.error || `Extraction failed (${res.status})`);
+      throw buildExtractError(data.error || `Extraction failed (${res.status})`, data.quota);
+    }
+    return data;
+  },
+
+  runBatchExtraction: async (params: {
+    items: Array<{ fileId: string; accessToken: string }>;
+    model: string;
+    allowFallback: boolean;
+    excludeModels?: string[];
+  }): Promise<RunBatchExtractResponse> => {
+    const res = await fetchWithRetry(`${API_BASE_URL}/api/extract/run-batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: params.items,
+        model: params.model,
+        allowFallback: params.allowFallback,
+        excludeModels: params.excludeModels ?? [],
+      }),
+    });
+    const data = (await res.json().catch(() => ({}))) as RunBatchExtractResponse;
+    if (!res.ok) {
+      throw buildExtractError(data.error || `Batch extraction failed (${res.status})`, data.quota);
     }
     return data;
   },

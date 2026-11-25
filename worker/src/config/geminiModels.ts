@@ -3,6 +3,7 @@ export interface GeminiModelDefinition {
   label: string;
   priority: number;
   description: string;
+  thinkingLevel: 'minimal' | 'low';
 }
 
 /**
@@ -25,24 +26,29 @@ export const GEMINI_MODEL_CONFIG = {
   defaultConcurrency: 5,
   defaultInlineThresholdMb: 4,
   defaultDailyTokenBudget: 1_000_000,
+  maxBatchItems: 4,
+  maxBatchInlineBytes: Math.floor(3.5 * 1024 * 1024),
   models: [
     {
       id: 'gemini-3.6-flash',
       label: 'Gemini 3.6 Flash',
       priority: 1,
       description: 'Primary fast vision extraction model',
+      thinkingLevel: 'minimal',
     },
     {
       id: 'gemini-3.5-flash-lite',
       label: 'Gemini 3.5 Flash-Lite',
       priority: 2,
       description: 'High-speed lightweight fallback model',
+      thinkingLevel: 'minimal',
     },
     {
       id: 'gemini-3.8-flash',
       label: 'Gemini 3.8 Flash',
       priority: 3,
       description: 'Secondary fallback (may experience high traffic)',
+      thinkingLevel: 'low',
     },
   ] as readonly GeminiModelDefinition[],
 } as const;

@@ -898,9 +898,15 @@ export function createAdminRoutes() {
     }
 
     const existing = await c.env.DB
-      .prepare('SELECT id, label, enabled, cooldown_until FROM gemini_api_keys WHERE id = ?')
+      .prepare('SELECT id, key_hash, label, enabled, cooldown_until FROM gemini_api_keys WHERE id = ?')
       .bind(id)
-      .first<{ id: string; label: string | null; enabled: number; cooldown_until: number }>();
+      .first<{
+        id: string;
+        key_hash: string;
+        label: string | null;
+        enabled: number;
+        cooldown_until: number;
+      }>();
 
     if (!existing) {
       return c.json({ error: 'API key not found.' }, 404);
@@ -911,12 +917,21 @@ export function createAdminRoutes() {
       body.label === undefined ? existing.label : body.label.trim().slice(0, 60) || existing.label;
     const nextCooldown = body.clearCooldown ? 0 : existing.cooldown_until;
 
-    await c.env.DB
-      .prepare(
-        'UPDATE gemini_api_keys SET enabled = ?, label = ?, cooldown_until = ? WHERE id = ?'
-      )
-      .bind(nextEnabled, nextLabel, nextCooldown, id)
-      .run();
+    const stmts: D1PreparedStatement[] = [
+      c.env.DB
+        .prepare(
+          'UPDATE gemini_api_keys SET enabled = ?, label = ?, cooldown_until = ? WHERE id = ?'
+        )
+        .bind(nextEnabled, nextLabel, nextCooldown, id),
+    ];
+    if (body.clearCooldown) {
+      stmts.push(
+        c.env.DB
+          .prepare('DELETE FROM gemini_key_model_cooldowns WHERE key_hash = ?')
+          .bind(existing.key_hash)
+      );
+    }
+    await c.env.DB.batch(stmts);
 
     return c.json({ ok: true, id, enabled: nextEnabled === 1, label: nextLabel });
   });

@@ -168,7 +168,7 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
     );
     expect(evilRes.status).toBe(400);
 
-    // Nested ZIP + valid image + DOCX + unsupported txt
+    // Nested ZIP + valid image + DOCX + CSV + unsupported html
     const innerZip = zipSync({
       'nested_iqama.jpg': JPG_BYTES,
     });
@@ -178,7 +178,8 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
       'person1.png': PNG_BYTES,
       'sub/archive.zip': innerZip,
       'manifest.docx': docxBytes,
-      'notes.csv': ENC.encode('a,b,c'),
+      'notes.csv': ENC.encode('NAME,ID,NAT\nALI,123,PK'),
+      'ignore.exe': ENC.encode('MZbad'),
     });
 
     const okRes = await app.request(
@@ -200,8 +201,10 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
       skipped: Array<{ fileName: string; reason: string }>;
     };
 
-    expect(data.items.length).toBe(4); // person1.png, nested_iqama.jpg, manifest/passport_scan.png, manifest.txt
-    expect(data.skipped.some((s) => s.fileName === 'notes.csv')).toBe(true);
+    expect(data.items.length).toBe(4); // person1.png, nested_iqama.jpg, manifest.docx, notes.csv
+    expect(data.items.some((i) => i.fileName === 'manifest.docx' && i.kind === 'text')).toBe(true);
+    expect(data.items.some((i) => i.fileName === 'notes.csv' && i.kind === 'text')).toBe(true);
+    expect(data.skipped.some((s) => s.fileName === 'ignore.exe')).toBe(true);
   });
 
   it('rotates 1-20 API keys round-robin, cools down 429 keys, falls back across models, and deletes securely', async () => {
@@ -329,11 +332,12 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
     expect(runData.quota).toMatchObject({
       totalKeys: 2,
       keysUsedToday: 2,
-      exhaustedKeysCount: 1,
+      exhaustedKeysCount: 0,
       activeKeyNumber: 2,
       tokensUsedToday: 1500,
       tokensRemaining: 998500,
       remainingPct: 100,
+      cooledDownModels: [],
     });
     expect(runData.documents[0]).toMatchObject({
       name: 'AHMED RAZA',
@@ -569,7 +573,7 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
     };
     expect(pubCfgData.maxPdfMb).toBe(40);
     expect(pubCfgData.activeKeyCount).toBe(1);
-    expect(pubCfgData.effectiveConcurrency).toBe(1);
+    expect(pubCfgData.effectiveConcurrency).toBe(4);
     expect(JSON.stringify(pubCfgData)).not.toContain(secretKey);
 
     // Delete key
@@ -684,5 +688,262 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+
+  it('extracts formatted Word tables and XLSX/CSV spreadsheets cleanly without logo noise', async () => {
+    const app = createApp();
+    const env = createTestEnv();
+
+    const tableDocxXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+      <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+        <w:body>
+          <w:tbl>
+            <w:tr>
+              <w:tc><w:p><w:r><w:t>NAME</w:t></w:r></w:p></w:tc>
+              <w:tc><w:p><w:r><w:t>NATIONALITY</w:t></w:r></w:p></w:tc>
+              <w:tc><w:p><w:r><w:t>IQAMA</w:t></w:r></w:p></w:tc>
+            </w:tr>
+            <w:tr>
+              <w:tc><w:p><w:r><w:t>MUHAMMAD BILAL</w:t></w:r></w:p></w:tc>
+              <w:tc><w:p><w:r><w:t>PAKISTANI</w:t></w:r></w:p></w:tc>
+              <w:tc><w:p><w:r><w:t>2455667788</w:t></w:r></w:p></w:tc>
+            </w:tr>
+          </w:tbl>
+          <mc:AlternateContent><mc:Fallback><w:p><w:r><w:t>FALLBACK DUPE</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent>
+        </w:body>
+      </w:document>`;
+
+    const tableDocxBytes = zipSync({
+      '[Content_Types].xml': ENC.encode('<?xml version="1.0"?><Types></Types>'),
+      'word/document.xml': ENC.encode(tableDocxXml),
+      'word/media/tiny_logo.png': PNG_BYTES, // < 8 KB logo skipped when text >= 20 chars
+    });
+
+    const docxIngest = await app.request(
+      'https://worker.local/api/extract/ingest',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(tableDocxBytes.byteLength),
+          'X-File-Name': 'manifest_table.docx',
+        },
+        body: tableDocxBytes,
+      },
+      env
+    );
+    expect(docxIngest.status).toBe(201);
+    const docxData = (await docxIngest.json()) as {
+      items: Array<{ fileId: string; accessToken: string; fileName: string; kind: string }>;
+    };
+    expect(docxData.items).toHaveLength(1);
+    expect(docxData.items[0].fileName).toBe('manifest_table.docx');
+    expect(docxData.items[0].kind).toBe('text');
+
+    const storedPreview = await app.request(
+      `https://worker.local/api/extract/file/${docxData.items[0].fileId}`,
+      { headers: { 'X-Extract-Token': docxData.items[0].accessToken } },
+      env
+    );
+    const unpackedText = await storedPreview.text();
+    expect(unpackedText).toContain('| NAME | NATIONALITY | IQAMA |');
+    expect(unpackedText).toContain('| MUHAMMAD BILAL | PAKISTANI | 2455667788 |');
+    expect(unpackedText).not.toContain('FALLBACK DUPE');
+
+    // XLSX spreadsheet ingest
+    const xlsxBytes = zipSync({
+      '[Content_Types].xml': ENC.encode('<?xml version="1.0"?><Types></Types>'),
+      'xl/sharedStrings.xml': ENC.encode(
+        '<sst><si><t>RAJESH KUMAR</t></si><si><t>INDIAN</t></si></sst>'
+      ),
+      'xl/worksheets/sheet1.xml': ENC.encode(
+        '<worksheet><sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c><c><v>2599887766</v></c></row></sheetData></worksheet>'
+      ),
+    });
+
+    const xlsxIngest = await app.request(
+      'https://worker.local/api/extract/ingest',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(xlsxBytes.byteLength),
+          'X-File-Name': 'crew_list.xlsx',
+        },
+        body: xlsxBytes,
+      },
+      env
+    );
+    expect(xlsxIngest.status).toBe(201);
+    const xlsxData = (await xlsxIngest.json()) as {
+      items: Array<{ fileId: string; accessToken: string; kind: string }>;
+    };
+    expect(xlsxData.items).toHaveLength(1);
+    const xlsxPreview = await app.request(
+      `https://worker.local/api/extract/file/${xlsxData.items[0].fileId}`,
+      { headers: { 'X-Extract-Token': xlsxData.items[0].accessToken } },
+      env
+    );
+    expect(await xlsxPreview.text()).toContain('| RAJESH KUMAR | INDIAN | 2599887766 |');
+  });
+
+  it('applies per-model 429 cooldown with 1 key, falls back to 3.5-flash-lite, batches 4 images in 1 call, and clears cooldown via Admin', async () => {
+    const env = createTestEnv({
+      GEMINI_API_KEYS: '',
+    });
+    const fullApp = createApp();
+    const cookie = await signupAndGetCookie(fullApp, env);
+
+    // Add 1 DB key via Admin API
+    const addKeyRes = await fullApp.request(
+      'https://worker.local/api/admin/gemini-keys',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: ORIGIN,
+          'X-Requested-With': CSRF,
+          Cookie: cookie,
+        },
+        body: JSON.stringify({ apiKey: 'dummy-Single-Key-9988776655', label: 'Primary' }),
+      },
+      env
+    );
+    expect(addKeyRes.status).toBe(201);
+    const {
+      key: { id: keyId },
+    } = (await addKeyRes.json()) as { key: { id: string } };
+
+    const seenModels: string[] = [];
+    const seenThinkingLevels: Array<string | undefined> = [];
+    let geminiCallCount = 0;
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      geminiCallCount += 1;
+      const url = typeof input === 'string' ? input : input.toString();
+      const match = url.match(/models\/([^:]+):generateContent/);
+      const model = match?.[1] ?? '';
+      seenModels.push(model);
+
+      const reqBody = JSON.parse(String(init?.body ?? '{}')) as {
+        generationConfig?: { thinkingConfig?: { thinkingLevel?: string } };
+      };
+      seenThinkingLevels.push(reqBody.generationConfig?.thinkingConfig?.thinkingLevel);
+
+      // Simulate single-key 3.6-flash daily free-tier limit (429 with retryDelay)
+      if (model === 'gemini-3.6-flash') {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 429,
+              message: 'Quota exceeded for metric: free_tier_requests, model: gemini-3.6-flash',
+              details: [
+                { retryDelay: '3600s', violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] },
+              ],
+            },
+          }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Batch response on fallback model gemini-3.5-flash-lite
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      batch_items: [
+                        { file_index: 0, documents: [{ name: 'PERSON ONE', passport_number: 'P111', iqama_number: null, national_id_number: null, visa_number: null, nationality: 'Pakistan' }] },
+                        { file_index: 1, documents: [{ name: 'PERSON TWO', passport_number: null, iqama_number: '2222222222', national_id_number: null, visa_number: null, nationality: 'India' }] },
+                        { file_index: 2, documents: [{ name: 'PERSON THREE', passport_number: 'P333', iqama_number: null, national_id_number: null, visa_number: null, nationality: 'Egypt' }] },
+                        { file_index: 3, documents: [{ name: 'PERSON FOUR', passport_number: null, iqama_number: null, national_id_number: '3520212345671', visa_number: null, nationality: 'Bangladesh' }] },
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+          usageMetadata: { promptTokenCount: 2000, candidatesTokenCount: 400, totalTokenCount: 2400 },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+
+    const batchApp = new Hono<{ Bindings: typeof env }>();
+    batchApp.route('/api/extract', createExtractRoutes({ geminiFetchImpl: mockFetch, sleepImpl: async () => {} }));
+
+    // Ingest 4 small images
+    const batchInputs: Array<{ fileId: string; accessToken: string }> = [];
+    for (let i = 0; i < 4; i++) {
+      const ing = await batchApp.request(
+        'https://worker.local/api/extract/ingest',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(PNG_BYTES.byteLength),
+            'X-File-Name': `img_${i}.png`,
+          },
+          body: PNG_BYTES,
+        },
+        env
+      );
+      expect(ing.status).toBe(201);
+      const ingJson = (await ing.json()) as { items: Array<{ fileId: string; accessToken: string }> };
+      batchInputs.push(ingJson.items[0]);
+    }
+
+    const batchRes = await batchApp.request(
+      'https://worker.local/api/extract/run-batch',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: batchInputs, model: 'auto' }),
+      },
+      env
+    );
+    expect(batchRes.status).toBe(200);
+    const batchJson = (await batchRes.json()) as {
+      ok: boolean;
+      modelUsed: string;
+      results: Array<{ fileId: string; documents: Array<{ name: string; idNumber: string; idType: string; nationality: string }> }>;
+      quota: { activeKeyStatus: string; cooledDownModels?: string[]; tokensUsedToday: number };
+    };
+
+    expect(geminiCallCount).toBe(2); // 1 rejected 429 on 3.6-flash + 1 batched 200 OK on 3.5-flash-lite
+    expect(seenModels).toEqual(['gemini-3.6-flash', 'gemini-3.5-flash-lite']);
+    expect(seenThinkingLevels).toEqual(['minimal', 'minimal']);
+    expect(batchJson.modelUsed).toBe('gemini-3.5-flash-lite');
+    expect(batchJson.results).toHaveLength(4);
+    expect(batchJson.results[0].documents[0]).toMatchObject({ name: 'PERSON ONE', idNumber: 'P111', nationality: 'PAKISTANI' });
+    expect(batchJson.results[3].documents[0]).toMatchObject({ name: 'PERSON FOUR', idNumber: '3520212345671', idType: 'national_id', nationality: 'BANGLADESHI' });
+    expect(batchJson.quota.activeKeyStatus).toBe('ready');
+    expect(batchJson.quota.cooledDownModels).toEqual(['gemini-3.6-flash']);
+
+    // Clear cooldown via Admin PATCH clears per-model cooldowns as well
+    const clearRes = await fullApp.request(
+      `https://worker.local/api/admin/gemini-keys/${keyId}`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: ORIGIN,
+          'X-Requested-With': CSRF,
+          Cookie: cookie,
+        },
+        body: JSON.stringify({ clearCooldown: true }),
+      },
+      env
+    );
+    expect(clearRes.status).toBe(200);
+
+    const cfgAfterClear = await fullApp.request('https://worker.local/api/extract/config', {}, env);
+    const cfgJson = (await cfgAfterClear.json()) as { quota: { cooledDownModels?: string[] } };
+    expect(cfgJson.quota.cooledDownModels).toEqual([]);
   });
 });

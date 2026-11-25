@@ -22,6 +22,7 @@ import {
   extractApi,
   TURNSTILE_SITE_KEY,
   type ExtractConfigResponse,
+  type ExtractedDocumentRecord,
   type ExtractedIdType,
   type GeminiModelOption,
   type IngestedExtractItem,
@@ -95,6 +96,77 @@ function getDisplayImagePreview(mimeType: string): boolean {
   return mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType === 'image/webp';
 }
 
+const MAX_BATCH_ITEMS = 4;
+const MAX_BATCH_INLINE_BYTES = Math.floor(3.2 * 1024 * 1024);
+const MAX_BATCH_PDF_BYTES = 1024 * 1024;
+const IMAGE_OPTIMIZE_MIN_BYTES = 900 * 1024;
+const IMAGE_OPTIMIZE_MAX_DIM = 1800;
+
+function isItemBatchEligible(item: IngestedExtractItem): boolean {
+  if (item.sizeBytes > MAX_BATCH_INLINE_BYTES) return false;
+  if (item.kind === 'image' || item.kind === 'text') return true;
+  return item.kind === 'pdf' && item.sizeBytes <= MAX_BATCH_PDF_BYTES;
+}
+
+function getPlaceholderKindForExt(ext: string): 'image' | 'pdf' | 'text' {
+  if (ext === 'pdf') return 'pdf';
+  if (ext === 'doc' || ext === 'docx' || ext === 'xlsx' || ext === 'csv' || ext === 'txt') {
+    return 'text';
+  }
+  return 'image';
+}
+
+/**
+ * Downscales large JPEG/PNG/WEBP camera photos (> 900 KB) to <= 1800 px JPEG (q=0.88)
+ * before upload to slash network + Gemini vision latency while keeping text crisp.
+ */
+async function optimizeImageForExtraction(file: File): Promise<File> {
+  if (file.size <= IMAGE_OPTIMIZE_MIN_BYTES) return file;
+  if (!getDisplayImagePreview(file.type)) return file;
+  if (typeof createImageBitmap !== 'function') return file;
+
+  let bitmap: ImageBitmap | null = null;
+  try {
+    bitmap = await createImageBitmap(file);
+    const maxSide = Math.max(bitmap.width, bitmap.height);
+    if (maxSide <= 0) return file;
+
+    const scale = maxSide > IMAGE_OPTIMIZE_MAX_DIM ? IMAGE_OPTIMIZE_MAX_DIM / maxSide : 1;
+    const targetW = Math.max(1, Math.round(bitmap.width * scale));
+    const targetH = Math.max(1, Math.round(bitmap.height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return file;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, targetW, targetH);
+    ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.88)
+    );
+    if (!blob || blob.size >= file.size * 0.9) return file;
+
+    const lower = file.name.toLowerCase();
+    const outName =
+      lower.endsWith('.jpg') || lower.endsWith('.jpeg')
+        ? file.name
+        : file.name.replace(/\.[^.]+$/, '') + '.jpg';
+
+    return new File([blob], outName, {
+      type: 'image/jpeg',
+      lastModified: file.lastModified,
+    });
+  } catch {
+    return file;
+  } finally {
+    bitmap?.close();
+  }
+}
+
 export function AllFilesDataSection() {
   const [config, setConfig] = useState<ExtractConfigResponse>({
     ok: true,
@@ -150,6 +222,8 @@ export function AllFilesDataSection() {
   const createdObjectUrlsRef = useRef<Set<string>>(new Set());
   const pendingJobsRef = useRef<Array<{ rowId: string; item: IngestedExtractItem }>>([]);
   const activeExtractionsRef = useRef<number>(0);
+  const activeUploadsRef = useRef<number>(0);
+  const coalesceTimerRef = useRef<number | null>(null);
 
   const modelPrefsRef = useRef({ selectedModel, allowFallback });
   modelPrefsRef.current = { selectedModel, allowFallback };
@@ -180,6 +254,10 @@ export function AllFilesDataSection() {
 
   useEffect(() => {
     return () => {
+      if (coalesceTimerRef.current !== null) {
+        window.clearTimeout(coalesceTimerRef.current);
+        coalesceTimerRef.current = null;
+      }
       for (const u of createdObjectUrlsRef.current) {
         URL.revokeObjectURL(u);
       }
@@ -251,6 +329,114 @@ export function AllFilesDataSection() {
     []
   );
 
+  const applyExtractedDocsToRow = useCallback(
+    (params: {
+      rowId: string;
+      item: IngestedExtractItem;
+      documents: ExtractedDocumentRecord[];
+      modelUsed: string;
+      elapsed: number;
+      replaceExistingRowOnly?: boolean;
+    }) => {
+      const docs: ExtractedDocumentRecord[] =
+        params.documents.length > 0
+          ? params.documents
+          : [
+              {
+                pageNumber: null,
+                name: null,
+                idNumber: null,
+                idType: null,
+                nationality: null,
+                confidence: null,
+              },
+            ];
+
+      setRows((prev) => {
+        const idx = prev.findIndex((r) => r.rowId === params.rowId);
+        if (idx === -1) return prev;
+        const existing = prev[idx];
+        const nextTried = Array.from(new Set([...existing.triedModels, params.modelUsed]));
+
+        if (params.replaceExistingRowOnly || docs.length === 1) {
+          const matchedDoc =
+            existing.pageNumber !== null
+              ? docs.find((d) => d.pageNumber === existing.pageNumber) ?? docs[0]
+              : docs[0];
+          const updated: ExtractTableRow = {
+            ...existing,
+            status: 'done',
+            name: matchedDoc.name,
+            idNumber: matchedDoc.idNumber,
+            idType: matchedDoc.idType,
+            nationality: matchedDoc.nationality,
+            confidence: matchedDoc.confidence,
+            pageNumber: matchedDoc.pageNumber ?? existing.pageNumber,
+            modelUsed: params.modelUsed,
+            triedModels: nextTried,
+            errorMessage: null,
+            startedAt: null,
+            elapsedMs: params.elapsed,
+            manuallyEdited: false,
+          };
+          const copy = [...prev];
+          copy[idx] = updated;
+          return copy;
+        }
+
+        // Multi-document PDF or Word/Excel table: expand into separate rows in-place
+        const expandedRows: ExtractTableRow[] = docs.map((doc, docIdx) => {
+          const newId = docIdx === 0 ? existing.rowId : `row-${crypto.randomUUID()}`;
+          if (docIdx > 0 && params.item.kind === 'pdf' && doc.pageNumber) {
+            void loadThumbnailForItem(newId, params.item, doc.pageNumber);
+          }
+          return {
+            rowId: newId,
+            fileId: params.item.fileId,
+            accessToken: params.item.accessToken,
+            fileName: params.item.fileName,
+            mimeType: params.item.mimeType,
+            sizeBytes: params.item.sizeBytes,
+            kind: params.item.kind,
+            sourceArchive: params.item.sourceArchive,
+            pageNumber: doc.pageNumber,
+            thumbnailUrl: existing.thumbnailUrl,
+            status: 'done',
+            uploadProgress: 100,
+            name: doc.name,
+            idNumber: doc.idNumber,
+            idType: doc.idType,
+            nationality: doc.nationality,
+            confidence: doc.confidence,
+            modelUsed: params.modelUsed,
+            triedModels: nextTried,
+            errorMessage: null,
+            startedAt: null,
+            elapsedMs: params.elapsed,
+            manuallyEdited: false,
+          };
+        });
+
+        return [...prev.slice(0, idx), ...expandedRows, ...prev.slice(idx + 1)];
+      });
+    },
+    [loadThumbnailForItem]
+  );
+
+  const applyQuotaFromError = useCallback((err: unknown) => {
+    const attachedQuota = (err as { quota?: PublicKeyQuotaSnapshot } | null)?.quota;
+    if (attachedQuota) {
+      setQuota(attachedQuota);
+      return;
+    }
+    void extractApi
+      .getConfig()
+      .then((cfg) => {
+        if (cfg.quota) setQuota(cfg.quota);
+      })
+      .catch(() => {});
+  }, []);
+
   const runSingleRowExtraction = useCallback(
     async (params: {
       rowId: string;
@@ -299,99 +485,26 @@ export function AllFilesDataSection() {
         }
 
         const elapsed = Math.max(1, Date.now() - startTs);
-        const docs = res.documents.length > 0 ? res.documents : [
-          { pageNumber: null, name: null, idNumber: null, idType: null, nationality: null, confidence: null },
-        ];
-
-        setRows((prev) => {
-          const idx = prev.findIndex((r) => r.rowId === params.rowId);
-          if (idx === -1) return prev;
-          const existing = prev[idx];
-          const nextTried = Array.from(new Set([...existing.triedModels, res.modelUsed]));
-
-          // On single-row Re-extract, update that row with the matching (or first) extracted doc
-          if (params.replaceExistingRowOnly || docs.length === 1) {
-            const matchedDoc =
-              existing.pageNumber !== null
-                ? docs.find((d) => d.pageNumber === existing.pageNumber) ?? docs[0]
-                : docs[0];
-            const updated: ExtractTableRow = {
-              ...existing,
-              status: 'done',
-              name: matchedDoc.name,
-              idNumber: matchedDoc.idNumber,
-              idType: matchedDoc.idType,
-              nationality: matchedDoc.nationality,
-              confidence: matchedDoc.confidence,
-              pageNumber: matchedDoc.pageNumber ?? existing.pageNumber,
-              modelUsed: res.modelUsed,
-              triedModels: nextTried,
-              errorMessage: null,
-              startedAt: null,
-              elapsedMs: elapsed,
-              manuallyEdited: false,
-            };
-            const copy = [...prev];
-            copy[idx] = updated;
-            return copy;
-          }
-
-          // Multi-document PDF: expand into separate rows in-place
-          const expandedRows: ExtractTableRow[] = docs.map((doc, docIdx) => {
-            const newId = docIdx === 0 ? existing.rowId : `row-${crypto.randomUUID()}`;
-            if (docIdx > 0 && params.kind === 'pdf' && doc.pageNumber) {
-              void loadThumbnailForItem(
-                newId,
-                {
-                  fileId: params.fileId,
-                  accessToken: params.accessToken,
-                  fileName: params.fileName,
-                  mimeType: params.mimeType,
-                  sizeBytes: params.sizeBytes,
-                  kind: params.kind,
-                  sourceArchive: params.sourceArchive,
-                },
-                doc.pageNumber
-              );
-            }
-            return {
-              rowId: newId,
-              fileId: params.fileId,
-              accessToken: params.accessToken,
-              fileName: params.fileName,
-              mimeType: params.mimeType,
-              sizeBytes: params.sizeBytes,
-              kind: params.kind,
-              sourceArchive: params.sourceArchive,
-              pageNumber: doc.pageNumber,
-              thumbnailUrl: docIdx === 0 ? existing.thumbnailUrl : existing.thumbnailUrl,
-              status: 'done',
-              uploadProgress: 100,
-              name: doc.name,
-              idNumber: doc.idNumber,
-              idType: doc.idType,
-              nationality: doc.nationality,
-              confidence: doc.confidence,
-              modelUsed: res.modelUsed,
-              triedModels: nextTried,
-              errorMessage: null,
-              startedAt: null,
-              elapsedMs: elapsed,
-              manuallyEdited: false,
-            };
-          });
-
-          return [...prev.slice(0, idx), ...expandedRows, ...prev.slice(idx + 1)];
+        applyExtractedDocsToRow({
+          rowId: params.rowId,
+          item: {
+            fileId: params.fileId,
+            accessToken: params.accessToken,
+            fileName: params.fileName,
+            mimeType: params.mimeType,
+            sizeBytes: params.sizeBytes,
+            kind: params.kind,
+            sourceArchive: params.sourceArchive,
+          },
+          documents: res.documents,
+          modelUsed: res.modelUsed,
+          elapsed,
+          replaceExistingRowOnly: params.replaceExistingRowOnly,
         });
       } catch (err) {
         const elapsed = Math.max(1, Date.now() - startTs);
         const message = err instanceof Error ? err.message : 'Extraction failed.';
-        void extractApi
-          .getConfig()
-          .then((cfg) => {
-            if (cfg.quota) setQuota(cfg.quota);
-          })
-          .catch(() => {});
+        applyQuotaFromError(err);
         setRows((prev) =>
           prev.map((r) =>
             r.rowId === params.rowId
@@ -407,7 +520,207 @@ export function AllFilesDataSection() {
         );
       }
     },
-    [loadThumbnailForItem]
+    [applyExtractedDocsToRow, applyQuotaFromError]
+  );
+
+  const runBatchRowExtraction = useCallback(
+    async (jobs: Array<{ rowId: string; item: IngestedExtractItem }>) => {
+      if (jobs.length === 0) return;
+      const startTs = Date.now();
+      const { selectedModel: modelChoice, allowFallback: fallbackEnabled } = modelPrefsRef.current;
+      const batchRowIds = new Set(jobs.map((j) => j.rowId));
+
+      setRows((prev) =>
+        prev.map((r) =>
+          batchRowIds.has(r.rowId)
+            ? {
+                ...r,
+                status: 'extracting',
+                errorMessage: null,
+                startedAt: startTs,
+                elapsedMs: 0,
+              }
+            : r
+        )
+      );
+
+      try {
+        const res = await extractApi.runBatchExtraction({
+          items: jobs.map((j) => ({ fileId: j.item.fileId, accessToken: j.item.accessToken })),
+          model: modelChoice,
+          allowFallback: fallbackEnabled,
+        });
+
+        if (res.quota) {
+          setQuota(res.quota);
+        }
+
+        const elapsed = Math.max(1, Date.now() - startTs);
+        const byFileId = new Map(res.results.map((r) => [r.fileId, r.documents]));
+        const missingJobs: Array<{ rowId: string; item: IngestedExtractItem }> = [];
+
+        for (const job of jobs) {
+          const docs = byFileId.get(job.item.fileId);
+          if (!docs) {
+            missingJobs.push(job);
+            continue;
+          }
+          applyExtractedDocsToRow({
+            rowId: job.rowId,
+            item: job.item,
+            documents: docs,
+            modelUsed: res.modelUsed,
+            elapsed,
+          });
+        }
+
+        if (missingJobs.length > 0) {
+          await Promise.all(
+            missingJobs.map((job) =>
+              runSingleRowExtraction({
+                rowId: job.rowId,
+                fileId: job.item.fileId,
+                accessToken: job.item.accessToken,
+                fileName: job.item.fileName,
+                mimeType: job.item.mimeType,
+                sizeBytes: job.item.sizeBytes,
+                kind: job.item.kind,
+                sourceArchive: job.item.sourceArchive,
+                thumbnailUrl: null,
+              })
+            )
+          );
+        }
+      } catch (err) {
+        applyQuotaFromError(err);
+        const message = err instanceof Error ? err.message : 'Batch extraction failed.';
+        const lower = message.toLowerCase();
+        const isHardStop =
+          !fallbackEnabled &&
+          (lower.includes('rate-limited') || lower.includes('quota') || lower.includes('no gemini api keys'));
+
+        if (isHardStop) {
+          const elapsed = Math.max(1, Date.now() - startTs);
+          setRows((prev) =>
+            prev.map((r) =>
+              batchRowIds.has(r.rowId)
+                ? {
+                    ...r,
+                    status: 'failed',
+                    errorMessage: message,
+                    startedAt: null,
+                    elapsedMs: elapsed,
+                  }
+                : r
+            )
+          );
+          return;
+        }
+
+        // Fall back gracefully to individual /api/extract/run calls on transient/size/parse errors
+        await Promise.all(
+          jobs.map((job) =>
+            runSingleRowExtraction({
+              rowId: job.rowId,
+              fileId: job.item.fileId,
+              accessToken: job.item.accessToken,
+              fileName: job.item.fileName,
+              mimeType: job.item.mimeType,
+              sizeBytes: job.item.sizeBytes,
+              kind: job.item.kind,
+              sourceArchive: job.item.sourceArchive,
+              thumbnailUrl: null,
+            })
+          )
+        );
+      }
+    },
+    [applyExtractedDocsToRow, applyQuotaFromError, runSingleRowExtraction]
+  );
+
+  const drainExtractionQueue = useCallback(
+    (forceFlushPartial = false) => {
+      const limit = effectiveConcurrencyRef.current;
+
+      while (activeExtractionsRef.current < limit && pendingJobsRef.current.length > 0) {
+        const first = pendingJobsRef.current[0];
+
+        // Non-batchable files (e.g. large multi-page PDFs) start immediately via Files API /run
+        if (!isItemBatchEligible(first.item)) {
+          pendingJobsRef.current.shift();
+          activeExtractionsRef.current += 1;
+          void runSingleRowExtraction({
+            rowId: first.rowId,
+            fileId: first.item.fileId,
+            accessToken: first.item.accessToken,
+            fileName: first.item.fileName,
+            mimeType: first.item.mimeType,
+            sizeBytes: first.item.sizeBytes,
+            kind: first.item.kind,
+            sourceArchive: first.item.sourceArchive,
+            thumbnailUrl: null,
+          }).finally(() => {
+            activeExtractionsRef.current = Math.max(0, activeExtractionsRef.current - 1);
+            drainExtractionQueue();
+          });
+          continue;
+        }
+
+        // Gather consecutive batchable items up to MAX_BATCH_ITEMS and MAX_BATCH_INLINE_BYTES
+        const batch: Array<{ rowId: string; item: IngestedExtractItem }> = [];
+        let batchBytes = 0;
+        for (const candidate of pendingJobsRef.current) {
+          if (!isItemBatchEligible(candidate.item)) break;
+          if (batch.length >= MAX_BATCH_ITEMS) break;
+          if (batch.length > 0 && batchBytes + candidate.item.sizeBytes > MAX_BATCH_INLINE_BYTES) break;
+          batch.push(candidate);
+          batchBytes += candidate.item.sizeBytes;
+        }
+
+        const isFullBatch =
+          batch.length >= MAX_BATCH_ITEMS ||
+          (batch.length > 0 && batchBytes > MAX_BATCH_INLINE_BYTES * 0.8);
+
+        if (!forceFlushPartial && activeUploadsRef.current > 0 && !isFullBatch) {
+          if (coalesceTimerRef.current === null) {
+            coalesceTimerRef.current = window.setTimeout(() => {
+              coalesceTimerRef.current = null;
+              drainExtractionQueue(true);
+            }, 220);
+          }
+          break;
+        }
+
+        if (coalesceTimerRef.current !== null) {
+          window.clearTimeout(coalesceTimerRef.current);
+          coalesceTimerRef.current = null;
+        }
+
+        pendingJobsRef.current.splice(0, batch.length);
+        activeExtractionsRef.current += 1;
+
+        const runPromise =
+          batch.length >= 2
+            ? runBatchRowExtraction(batch)
+            : runSingleRowExtraction({
+                rowId: batch[0].rowId,
+                fileId: batch[0].item.fileId,
+                accessToken: batch[0].item.accessToken,
+                fileName: batch[0].item.fileName,
+                mimeType: batch[0].item.mimeType,
+                sizeBytes: batch[0].item.sizeBytes,
+                kind: batch[0].item.kind,
+                sourceArchive: batch[0].item.sourceArchive,
+                thumbnailUrl: null,
+              });
+
+        void runPromise.finally(() => {
+          activeExtractionsRef.current = Math.max(0, activeExtractionsRef.current - 1);
+          drainExtractionQueue();
+        });
+      }
+    },
+    [runBatchRowExtraction, runSingleRowExtraction]
   );
 
   const handleFilesSelected = async (fileList: FileList | File[]) => {
@@ -463,8 +776,7 @@ export function AllFilesDataSection() {
     // Create initial uploading placeholder rows
     const placeholders = validFiles.map((file) => {
       const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-      const kind: 'image' | 'pdf' | 'text' =
-        ext === 'pdf' ? 'pdf' : ext === 'doc' || ext === 'docx' ? 'text' : 'image';
+      const kind = getPlaceholderKindForExt(ext);
       const rowId = `row-${crypto.randomUUID()}`;
       let localThumb: string | null = null;
       if (kind === 'image' && getDisplayImagePreview(file.type)) {
@@ -500,31 +812,10 @@ export function AllFilesDataSection() {
 
     setRows((prev) => [...prev, ...placeholders.map((p) => p.row)]);
 
-    const drainExtractionQueue = () => {
-      const limit = effectiveConcurrencyRef.current;
-      while (activeExtractionsRef.current < limit && pendingJobsRef.current.length > 0) {
-        const nextJob = pendingJobsRef.current.shift()!;
-        activeExtractionsRef.current += 1;
-        void runSingleRowExtraction({
-          rowId: nextJob.rowId,
-          fileId: nextJob.item.fileId,
-          accessToken: nextJob.item.accessToken,
-          fileName: nextJob.item.fileName,
-          mimeType: nextJob.item.mimeType,
-          sizeBytes: nextJob.item.sizeBytes,
-          kind: nextJob.item.kind,
-          sourceArchive: nextJob.item.sourceArchive,
-          thumbnailUrl: null,
-        }).finally(() => {
-          activeExtractionsRef.current = Math.max(0, activeExtractionsRef.current - 1);
-          drainExtractionQueue();
-        });
-      }
-    };
-
-    // Upload files in bounded concurrency (3) and dispatch extracted items immediately to the AI worker pool
+    // Upload files in bounded concurrency (4) and coalesce small inline items into fast batches
     const uploadQueue = [...placeholders];
-    const uploadWorkerCount = Math.min(3, uploadQueue.length);
+    const uploadWorkerCount = Math.min(4, uploadQueue.length);
+    activeUploadsRef.current += uploadQueue.length;
 
     const runUploadWorker = async () => {
       while (uploadQueue.length > 0) {
@@ -532,8 +823,9 @@ export function AllFilesDataSection() {
         if (!current) break;
         const { file, row } = current;
         try {
+          const uploadFile = await optimizeImageForExtraction(file);
           const ingestRes = await extractApi.ingestFileWithProgress({
-            file,
+            file: uploadFile,
             turnstileToken: batchTicket ? '' : turnstileToken,
             batchTicket,
             onProgress: (pct) => {
@@ -577,7 +869,7 @@ export function AllFilesDataSection() {
                   rowId: id,
                   fileId: item.fileId,
                   accessToken: item.accessToken,
-                  fileName: item.fileName,
+                  fileName: items.length === 1 ? file.name : item.fileName,
                   mimeType: item.mimeType,
                   sizeBytes: item.sizeBytes,
                   kind: item.kind,
@@ -617,7 +909,6 @@ export function AllFilesDataSection() {
             );
             pendingJobsRef.current.push({ rowId: newRow.rowId, item });
           }
-          drainExtractionQueue();
         } catch (err) {
           const message = err instanceof Error ? err.message : 'Upload failed.';
           setRows((prev) =>
@@ -633,11 +924,15 @@ export function AllFilesDataSection() {
                 : r
             )
           );
+        } finally {
+          activeUploadsRef.current = Math.max(0, activeUploadsRef.current - 1);
+          drainExtractionQueue(activeUploadsRef.current === 0);
         }
       }
     };
 
     await Promise.all(Array.from({ length: uploadWorkerCount }, () => runUploadWorker()));
+    drainExtractionQueue(activeUploadsRef.current === 0);
   };
 
   const triggerReextract = async (row: ExtractTableRow, tryNextModel: boolean) => {
@@ -875,6 +1170,12 @@ export function AllFilesDataSection() {
                 Cooldown
               </span>
             )}
+
+            {quota.activeKeyStatus === 'ready' && (quota.cooledDownModels?.length ?? 0) > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 font-semibold">
+                {quota.cooledDownModels!.map((m) => getShortModelBadge(m)).join(', ')} Cooldown &middot; Fallback Ready
+              </span>
+            )}
           </div>
 
           {quota.totalKeys > 0 &&
@@ -974,13 +1275,13 @@ export function AllFilesDataSection() {
               <Upload className="w-5 h-5" />
             </div>
             <div className="text-sm font-bold text-[#0A1832]">
-              Drop images, PDFs, ZIP archives, or Word documents here
+              Drop images, PDFs, ZIP archives, Word, or Excel/CSV documents here
             </div>
             <div className="text-xs text-slate-500">
               or click to select multiple files &middot; up to {config.maxPdfMb} MB per PDF/ZIP
             </div>
             <div className="text-[11px] text-slate-400">
-              Accepted: JPG, JPEG, PNG, WEBP, HEIC, PDF (multi-page), ZIP (nested supported), DOCX
+              Accepted: JPG, JPEG, PNG, WEBP, HEIC, PDF (multi-page), ZIP (nested supported), DOCX, DOC, XLSX, CSV, TXT
               {config.effectiveConcurrency > 1
                 ? ` · Parallel concurrency: ${config.effectiveConcurrency}`
                 : ''}

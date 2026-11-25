@@ -3,6 +3,7 @@ import { GEMINI_MODEL_CONFIG } from '../config/geminiModels';
 import {
   ArchiveExtractionError,
   getExtensionLower,
+  unpackExcelSpreadsheet,
   unpackWordDocument,
   unpackZipArchive,
   validateExtractUploadHeader,
@@ -16,7 +17,11 @@ import {
   hmacSign,
   sha256Hex,
 } from '../services/cryptoUtils';
-import { extractDocumentWithGemini, GeminiExtractionError } from '../services/geminiExtractor';
+import {
+  extractBatchWithGemini,
+  extractDocumentWithGemini,
+  GeminiExtractionError,
+} from '../services/geminiExtractor';
 import {
   getExtractSettings,
   getPublicQuotaSnapshot,
@@ -142,33 +147,86 @@ function getExtensionForMimeOrName(mimeType: string, fileName: string): string {
   return 'bin';
 }
 
-async function verifyExtractionFileToken(
-  c: Context<{ Bindings: Env }>,
-  fileId: string
-): Promise<{ ok: true; row: ExtractionFileRow } | { ok: false; response: Response }> {
-  const token = (c.req.header('X-Extract-Token') ?? '').trim();
+async function verifyFileAccessByToken(
+  db: D1Database,
+  fileId: string,
+  token: string
+): Promise<
+  | { ok: true; row: ExtractionFileRow }
+  | { ok: false; status: 401 | 403 | 404 | 410; error: string }
+> {
   if (!token) {
-    return { ok: false, response: c.json({ error: 'Missing extraction access token.' }, 401) };
+    return { ok: false, status: 401, error: 'Missing extraction access token.' };
   }
 
-  const row = await c.env.DB
+  const row = await db
     .prepare('SELECT * FROM extraction_files WHERE id = ?')
     .bind(fileId)
     .first<ExtractionFileRow>();
 
   if (!row || row.status !== 'active') {
-    return { ok: false, response: c.json({ error: 'File not found or already deleted.' }, 404) };
+    return { ok: false, status: 404, error: 'File not found or already deleted.' };
   }
   if (row.expires_at <= Date.now()) {
-    return { ok: false, response: c.json({ error: 'Temporary extraction file has expired.' }, 410) };
+    return { ok: false, status: 410, error: 'Temporary extraction file has expired.' };
   }
 
   const incomingHash = await sha256Hex(token);
   if (!constantTimeEqualStr(incomingHash, row.access_token_hash)) {
-    return { ok: false, response: c.json({ error: 'Invalid extraction access token.' }, 403) };
+    return { ok: false, status: 403, error: 'Invalid extraction access token.' };
   }
 
   return { ok: true, row };
+}
+
+async function verifyExtractionFileToken(
+  c: Context<{ Bindings: Env }>,
+  fileId: string
+): Promise<{ ok: true; row: ExtractionFileRow } | { ok: false; response: Response }> {
+  const token = (c.req.header('X-Extract-Token') ?? '').trim();
+  const res = await verifyFileAccessByToken(c.env.DB, fileId, token);
+  if (!res.ok) {
+    return { ok: false, response: c.json({ error: res.error }, res.status) };
+  }
+  return { ok: true, row: res.row };
+}
+
+async function enforceRunRateLimit(c: Context<{ Bindings: Env }>): Promise<Response | null> {
+  const ip = getClientIp(c.req.raw);
+  const rate = await checkRateLimit({
+    db: c.env.DB,
+    key: `extract_run:${ip}`,
+    limit: 60,
+    windowMs: 60 * 1000,
+  });
+  if (!rate.allowed) {
+    c.header('Retry-After', String(rate.retryAfterSeconds));
+    return c.json(
+      { error: `Too many extraction requests. Retry in ${rate.retryAfterSeconds}s.` },
+      429
+    );
+  }
+  return null;
+}
+
+async function handleExtractionErrorResponse(
+  c: Context<{ Bindings: Env }>,
+  err: unknown
+): Promise<Response> {
+  const quota = await getPublicQuotaSnapshot({ env: c.env }).catch(() => undefined);
+  if (err instanceof GeminiExtractionError) {
+    return c.json(
+      { error: err.message, attempts: err.attempts, ...(quota ? { quota } : {}) },
+      err.statusCode as 400 | 429 | 502 | 503 | 504
+    );
+  }
+  return c.json(
+    {
+      error: err instanceof Error ? err.message : 'Extraction failed.',
+      ...(quota ? { quota } : {}),
+    },
+    502
+  );
 }
 
 async function persistExtractItemsBatch(params: {
@@ -264,7 +322,9 @@ export function createExtractRoutes(deps: ExtractRouteDeps = {}) {
     const pool = await loadActiveGeminiKeyPool(c.env);
     const activeKeyCount = pool.length;
     const effectiveConcurrency =
-      activeKeyCount > 0 ? Math.max(1, Math.min(settings.concurrency, activeKeyCount)) : 1;
+      activeKeyCount > 0
+        ? Math.min(settings.concurrency, Math.max(4, activeKeyCount * 3))
+        : 1;
     const quota = await getPublicQuotaSnapshot({ env: c.env });
 
     return c.json({
@@ -445,8 +505,8 @@ export function createExtractRoutes(deps: ExtractRouteDeps = {}) {
     const now = Date.now();
     const spec = validation.spec;
 
-    // Fast streaming path for single image or PDF (no full-file RAM buffering for huge 50 MB PDFs!)
-    if (spec.kind === 'image' || spec.kind === 'pdf') {
+    // Fast streaming path for single image, PDF, or plain text / CSV (no full-file RAM buffering for huge 50 MB PDFs!)
+    if (spec.kind === 'image' || spec.kind === 'pdf' || spec.kind === 'text') {
       const fileId = generateShortId(12);
       const accessToken = generateRandomToken(32);
       const accessTokenHash = await sha256Hex(accessToken);
@@ -593,25 +653,31 @@ export function createExtractRoutes(deps: ExtractRouteDeps = {}) {
     }
 
     try {
+      const safeOriginalName = sanitizeDisplayFilename(filename);
       const unpacked =
         spec.kind === 'zip'
           ? await unpackZipArchive({
               zipBytes: rawBytes,
-              archiveName: sanitizeDisplayFilename(filename),
+              archiveName: safeOriginalName,
               maxPdfBytes,
               env: c.env,
             })
-          : await unpackWordDocument({
-              bytes: rawBytes,
-              fileName: sanitizeDisplayFilename(filename),
-              ext: spec.kind,
-              env: c.env,
-            });
+          : spec.kind === 'xlsx'
+            ? unpackExcelSpreadsheet({
+                bytes: rawBytes,
+                fileName: safeOriginalName,
+              })
+            : await unpackWordDocument({
+                bytes: rawBytes,
+                fileName: safeOriginalName,
+                ext: spec.kind,
+                env: c.env,
+              });
 
       if (unpacked.items.length === 0) {
         return c.json(
           {
-            error: 'No supported images or PDF documents were found inside this file.',
+            error: 'No supported images, PDFs, spreadsheets, or readable documents were found inside this file.',
             skipped: unpacked.skipped,
           },
           400
@@ -645,20 +711,8 @@ export function createExtractRoutes(deps: ExtractRouteDeps = {}) {
 
   // Run AI extraction for one ingested file
   app.post('/run', async (c) => {
-    const ip = getClientIp(c.req.raw);
-    const rate = await checkRateLimit({
-      db: c.env.DB,
-      key: `extract_run:${ip}`,
-      limit: 60,
-      windowMs: 60 * 1000,
-    });
-    if (!rate.allowed) {
-      c.header('Retry-After', String(rate.retryAfterSeconds));
-      return c.json(
-        { error: `Extraction rate limit reached. Try again in ${rate.retryAfterSeconds}s.` },
-        429
-      );
-    }
+    const rateLimited = await enforceRunRateLimit(c);
+    if (rateLimited) return rateLimited;
 
     let body: {
       fileId?: string;
@@ -724,17 +778,110 @@ export function createExtractRoutes(deps: ExtractRouteDeps = {}) {
         attempts: outcome.attempts,
       });
     } catch (err) {
-      const quota = await getPublicQuotaSnapshot({ env: c.env }).catch(() => undefined);
-      if (err instanceof GeminiExtractionError) {
-        return c.json(
-          { error: err.message, attempts: err.attempts, ...(quota ? { quota } : {}) },
-          err.statusCode as 400 | 429 | 502 | 503 | 504
-        );
-      }
+      return handleExtractionErrorResponse(c, err);
+    }
+  });
+
+  // Run multi-file single-call AI extraction for up to maxBatchItems small inline files
+  app.post('/run-batch', async (c) => {
+    const rateLimited = await enforceRunRateLimit(c);
+    if (rateLimited) return rateLimited;
+
+    let body: {
+      items?: Array<{ fileId?: string; accessToken?: string }>;
+      model?: string;
+      allowFallback?: boolean;
+      excludeModels?: string[];
+    };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const rawItems = Array.isArray(body.items) ? body.items : [];
+    if (rawItems.length === 0) {
+      return c.json({ error: 'At least one batch item is required.' }, 400);
+    }
+    if (rawItems.length > GEMINI_MODEL_CONFIG.maxBatchItems) {
       return c.json(
-        { error: err instanceof Error ? err.message : 'Extraction failed.', ...(quota ? { quota } : {}) },
-        502
+        { error: `At most ${GEMINI_MODEL_CONFIG.maxBatchItems} files can be extracted in one batch.` },
+        400
       );
+    }
+
+    const headerFallbackToken = (c.req.header('X-Extract-Token') ?? '').trim();
+    const verifiedRows: ExtractionFileRow[] = [];
+    const seenIds = new Set<string>();
+
+    for (const item of rawItems) {
+      const fileId = (item?.fileId ?? '').trim();
+      if (!fileId) {
+        return c.json({ error: 'Each batch item must include a valid fileId.' }, 400);
+      }
+      if (seenIds.has(fileId)) {
+        return c.json({ error: `Duplicate fileId in batch: ${fileId}` }, 400);
+      }
+      seenIds.add(fileId);
+
+      const token = (item?.accessToken ?? '').trim() || headerFallbackToken;
+      const auth = await verifyFileAccessByToken(c.env.DB, fileId, token);
+      if (!auth.ok) {
+        return c.json({ error: auth.error, fileId }, auth.status);
+      }
+      verifiedRows.push(auth.row);
+    }
+
+    const totalBytes = verifiedRows.reduce((sum, r) => sum + r.size_bytes, 0);
+    if (totalBytes > GEMINI_MODEL_CONFIG.maxBatchInlineBytes) {
+      return c.json(
+        { error: 'Combined batch payload exceeds inline size limit; process items individually.' },
+        400
+      );
+    }
+
+    try {
+      const outcome = await extractBatchWithGemini({
+        env: c.env,
+        items: verifiedRows.map((row) => ({
+          fileId: row.id,
+          mimeType: row.mime_type,
+          displayName: row.original_name,
+          sizeBytes: row.size_bytes,
+          loadBytes: async () => {
+            const obj = await c.env.FILES.get(row.r2_key);
+            if (!obj) {
+              throw new GeminiExtractionError(
+                `Uploaded source file (${row.original_name}) is missing from storage.`,
+                404
+              );
+            }
+            return new Uint8Array(await obj.arrayBuffer());
+          },
+        })),
+        requestedModel: body.model ?? 'auto',
+        allowFallback: Boolean(body.allowFallback),
+        excludeModels: Array.isArray(body.excludeModels) ? body.excludeModels : [],
+        fetchImpl: deps.geminiFetchImpl,
+        sleepImpl: deps.sleepImpl,
+      });
+
+      const quota = await getPublicQuotaSnapshot({
+        env: c.env,
+        preferredKeyHash: outcome.keyHashUsed,
+      });
+
+      return c.json({
+        ok: true,
+        modelUsed: outcome.modelUsed,
+        durationMs: outcome.durationMs,
+        tokenUsage: outcome.tokenUsage,
+        quota,
+        results: outcome.items,
+        attempts: outcome.attempts,
+      });
+    } catch (err) {
+      return handleExtractionErrorResponse(c, err);
     }
   });
 

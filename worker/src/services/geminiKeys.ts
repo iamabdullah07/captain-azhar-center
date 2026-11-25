@@ -20,6 +20,7 @@ export interface PublicKeyQuotaSnapshot {
   exhaustedKeysCount: number;
   activeKeyNumber: number;
   activeKeyStatus: 'ready' | 'cooldown' | 'exhausted' | 'none';
+  cooledDownModels: string[];
   dailyTokenBudget: number;
   tokensUsedToday: number;
   tokensRemaining: number;
@@ -237,19 +238,33 @@ export async function loadActiveGeminiKeyPool(env: Env): Promise<PooledGeminiKey
   return pool;
 }
 
+export async function loadModelCooldownMap(db: D1Database, now = Date.now()): Promise<Map<string, number>> {
+  const rows = await db
+    .prepare('SELECT key_hash, model_id, cooldown_until FROM gemini_key_model_cooldowns WHERE cooldown_until > ?')
+    .bind(now)
+    .all<{ key_hash: string; model_id: string; cooldown_until: number }>();
+  const map = new Map<string, number>();
+  for (const r of rows.results ?? []) {
+    map.set(`${r.key_hash}:${r.model_id}`, r.cooldown_until);
+  }
+  return map;
+}
+
 /**
- * Selects the next healthy Gemini API key in round-robin order and advances the persisted cursor.
+ * Selects the next healthy Gemini API key for a given model in round-robin order and advances the persisted cursor.
  */
 export async function pickRoundRobinKey(params: {
   pool: PooledGeminiKey[];
   db: D1Database;
+  modelId?: string;
+  modelCooldownMap?: Map<string, number>;
   excludedKeyHashes?: Set<string>;
   now?: number;
 }): Promise<
   | { ok: true; key: PooledGeminiKey }
   | { ok: false; reason: 'none_configured' | 'all_cooldown'; retryAfterSeconds: number }
 > {
-  const { pool, db, excludedKeyHashes } = params;
+  const { pool, db, modelId, modelCooldownMap, excludedKeyHashes } = params;
   const now = params.now ?? Date.now();
 
   if (pool.length === 0) {
@@ -268,7 +283,10 @@ export async function pickRoundRobinKey(params: {
     const candidate = pool[idx];
     if (excludedKeyHashes?.has(candidate.keyHash)) continue;
 
-    if (candidate.cooldownUntil <= now) {
+    const modelCooldown = modelId ? modelCooldownMap?.get(`${candidate.keyHash}:${modelId}`) ?? 0 : 0;
+    const effectiveCooldown = Math.max(candidate.cooldownUntil, modelCooldown);
+
+    if (effectiveCooldown <= now) {
       const nextCursor = (idx + 1) % pool.length;
       await db
         .prepare('UPDATE extract_settings SET key_rr_cursor = ? WHERE id = 1')
@@ -277,8 +295,8 @@ export async function pickRoundRobinKey(params: {
       return { ok: true, key: candidate };
     }
 
-    if (candidate.cooldownUntil < earliestCooldownUntil) {
-      earliestCooldownUntil = candidate.cooldownUntil;
+    if (effectiveCooldown < earliestCooldownUntil) {
+      earliestCooldownUntil = effectiveCooldown;
     }
   }
 
@@ -348,12 +366,56 @@ export async function recordGeminiKeyCooldown(params: {
   key: PooledGeminiKey;
   cooldownMs: number;
   errorMessage: string;
+  modelId?: string;
+  modelCooldownMap?: Map<string, number>;
   now?: number;
 }): Promise<void> {
-  const { db, key, cooldownMs, errorMessage } = params;
+  const { db, key, cooldownMs, errorMessage, modelId, modelCooldownMap } = params;
   const now = params.now ?? Date.now();
   const cooldownUntil = cooldownMs > 0 ? now + cooldownMs : 0;
   const safeErr = errorMessage.slice(0, 180);
+
+  if (modelId) {
+    modelCooldownMap?.set(`${key.keyHash}:${modelId}`, cooldownUntil);
+    const modelStmt = db
+      .prepare(
+        `INSERT INTO gemini_key_model_cooldowns (key_hash, model_id, cooldown_until, last_error)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(key_hash, model_id) DO UPDATE SET
+           cooldown_until = excluded.cooldown_until,
+           last_error = excluded.last_error`
+      )
+      .bind(key.keyHash, modelId, cooldownUntil, safeErr);
+
+    if (key.source === 'db' && key.id) {
+      await db.batch([
+        modelStmt,
+        db
+          .prepare(
+            `UPDATE gemini_api_keys
+             SET last_used_at = ?, error_count = error_count + 1, last_error = ?
+             WHERE id = ?`
+          )
+          .bind(now, safeErr, key.id),
+      ]);
+      return;
+    }
+
+    await db.batch([
+      modelStmt,
+      db
+        .prepare(
+          `INSERT INTO gemini_key_runtime (key_hash, cooldown_until, last_used_at, success_count, error_count, last_error)
+           VALUES (?, 0, ?, 0, 1, ?)
+           ON CONFLICT(key_hash) DO UPDATE SET
+             last_used_at = excluded.last_used_at,
+             error_count = gemini_key_runtime.error_count + 1,
+             last_error = excluded.last_error`
+        )
+        .bind(key.keyHash, now, safeErr),
+    ]);
+    return;
+  }
 
   key.cooldownUntil = cooldownUntil;
 
@@ -392,13 +454,14 @@ export async function getPublicQuotaSnapshot(params: {
   const now = params.now ?? Date.now();
   const today = getTodayUtcDateStr(now);
 
-  const [settings, pool, dailyRes] = await Promise.all([
+  const [settings, pool, dailyRes, modelCooldownMap] = await Promise.all([
     getExtractSettings(env),
     loadActiveGeminiKeyPool(env),
     env.DB
       .prepare('SELECT * FROM gemini_key_daily_usage WHERE usage_date = ?')
       .bind(today)
       .all<GeminiKeyDailyUsageRow>(),
+    loadModelCooldownMap(env.DB, now),
   ]);
 
   const budget = settings.daily_token_budget || GEMINI_MODEL_CONFIG.defaultDailyTokenBudget;
@@ -409,6 +472,7 @@ export async function getPublicQuotaSnapshot(params: {
       exhaustedKeysCount: 0,
       activeKeyNumber: 0,
       activeKeyStatus: 'none',
+      cooledDownModels: [],
       dailyTokenBudget: budget,
       tokensUsedToday: 0,
       tokensRemaining: 0,
@@ -422,6 +486,16 @@ export async function getPublicQuotaSnapshot(params: {
     usageByHash.set(row.key_hash, row);
   }
 
+  const getCooledModelsForKey = (k: PooledGeminiKey): string[] => {
+    const cooled: string[] = [];
+    for (const m of GEMINI_MODEL_CONFIG.models) {
+      if ((modelCooldownMap.get(`${k.keyHash}:${m.id}`) ?? 0) > now) {
+        cooled.push(m.id);
+      }
+    }
+    return cooled;
+  };
+
   let keysUsedToday = 0;
   let exhaustedKeysCount = 0;
 
@@ -429,18 +503,17 @@ export async function getPublicQuotaSnapshot(params: {
     const u = usageByHash.get(k.keyHash);
     const usedTokens = u?.total_tokens ?? 0;
     const reqs = u?.requests_count ?? 0;
-    const inCooldown = k.cooldownUntil > now;
-    if (reqs > 0 || inCooldown) {
+    const cooledModels = getCooledModelsForKey(k);
+    const allModelsCooldown = cooledModels.length >= GEMINI_MODEL_CONFIG.models.length;
+    const inFullCooldown = k.cooldownUntil > now || allModelsCooldown;
+    if (reqs > 0 || cooledModels.length > 0 || k.cooldownUntil > now) {
       keysUsedToday += 1;
     }
-    if (inCooldown || usedTokens >= budget) {
+    if (inFullCooldown || usedTokens >= budget) {
       exhaustedKeysCount += 1;
     }
   }
 
-  // Pick which single key to report right now:
-  // 1) If preferredKeyHash (just executed) exists, report that key.
-  // 2) Otherwise report the next ready key at cursor (or most recently used if all in cooldown).
   let selectedIdx = -1;
   if (preferredKeyHash) {
     selectedIdx = pool.findIndex((k) => k.keyHash === preferredKeyHash);
@@ -449,7 +522,8 @@ export async function getPublicQuotaSnapshot(params: {
     const cursor = Math.max(0, settings.key_rr_cursor ?? 0);
     for (let offset = 0; offset < pool.length; offset++) {
       const idx = (cursor + offset) % pool.length;
-      if (pool[idx].cooldownUntil <= now) {
+      const cooled = getCooledModelsForKey(pool[idx]);
+      if (pool[idx].cooldownUntil <= now && cooled.length < GEMINI_MODEL_CONFIG.models.length) {
         selectedIdx = idx;
         break;
       }
@@ -463,13 +537,16 @@ export async function getPublicQuotaSnapshot(params: {
   const activeUsage = usageByHash.get(activeKey.keyHash);
   const tokensUsedToday = activeUsage?.total_tokens ?? 0;
   const requestsToday = activeUsage?.requests_count ?? 0;
-  const inCooldown = activeKey.cooldownUntil > now;
-  const tokensRemaining = inCooldown ? 0 : Math.max(0, budget - tokensUsedToday);
-  const remainingPct = inCooldown
+  const cooledDownModels = getCooledModelsForKey(activeKey);
+  const allModelsCooldown = cooledDownModels.length >= GEMINI_MODEL_CONFIG.models.length;
+  const inFullCooldown = activeKey.cooldownUntil > now || allModelsCooldown;
+
+  const tokensRemaining = Math.max(0, budget - tokensUsedToday);
+  const remainingPct = inFullCooldown
     ? 0
     : Math.max(0, Math.min(100, Math.round((tokensRemaining / budget) * 100)));
 
-  const activeKeyStatus: PublicKeyQuotaSnapshot['activeKeyStatus'] = inCooldown
+  const activeKeyStatus: PublicKeyQuotaSnapshot['activeKeyStatus'] = inFullCooldown
     ? 'cooldown'
     : tokensRemaining <= 0
     ? 'exhausted'
@@ -481,6 +558,7 @@ export async function getPublicQuotaSnapshot(params: {
     exhaustedKeysCount,
     activeKeyNumber: selectedIdx + 1,
     activeKeyStatus,
+    cooledDownModels,
     dailyTokenBudget: budget,
     tokensUsedToday,
     tokensRemaining,

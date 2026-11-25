@@ -1,7 +1,7 @@
 import { Unzip, UnzipInflate } from 'fflate';
 import type { Env } from '../types';
 
-export type SupportedExtractKind = 'image' | 'pdf' | 'zip' | 'docx' | 'doc';
+export type SupportedExtractKind = 'image' | 'pdf' | 'zip' | 'docx' | 'doc' | 'xlsx' | 'text';
 
 export interface ValidatedUploadSpec {
   kind: SupportedExtractKind;
@@ -32,7 +32,7 @@ export const ZIP_SAFETY_LIMITS = {
 
 const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif']);
 const HEIC_BRANDS = new Set(['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'mif1', 'msf1', 'heif']);
-const OOXML_MARKERS = ['[Content_Types].xml', '_rels/', 'docProps/', 'word/'];
+const OOXML_MARKERS = ['[Content_Types].xml', '_rels/', 'docProps/', 'word/', 'xl/'];
 const DANGEROUS_PREFIXES = ['<!doctype', '<html', '<svg', '<script', '<?php'];
 
 export class ArchiveExtractionError extends Error {
@@ -204,9 +204,42 @@ export function validateExtractUploadHeader(params: {
     return { ok: true, spec: { kind: 'doc', extension: 'doc', mimeType: 'application/msword' } };
   }
 
+  // XLSX
+  if (ext === 'xlsx') {
+    if (sizeBytes > 25 * 1024 * 1024) {
+      return { ok: false, error: 'XLSX file exceeds the 25 MB maximum size limit.' };
+    }
+    if (!isOoxmlDocx(headerBytes)) {
+      return { ok: false, error: 'Invalid XLSX spreadsheet structure.' };
+    }
+    return {
+      ok: true,
+      spec: {
+        kind: 'xlsx',
+        extension: 'xlsx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      },
+    };
+  }
+
+  // Plain Text & CSV
+  if (ext === 'txt' || ext === 'csv') {
+    if (sizeBytes > 10 * 1024 * 1024) {
+      return { ok: false, error: `${ext.toUpperCase()} file exceeds the 10 MB maximum size limit.` };
+    }
+    return {
+      ok: true,
+      spec: {
+        kind: 'text',
+        extension: ext,
+        mimeType: 'text/plain',
+      },
+    };
+  }
+
   return {
     ok: false,
-    error: `Unsupported file type (.${ext}). Accepted: JPG, JPEG, PNG, WEBP, HEIC, PDF, ZIP, DOCX.`,
+    error: `Unsupported file type (.${ext}). Accepted: JPG, JPEG, PNG, WEBP, HEIC, PDF, ZIP, DOCX, DOC, XLSX, CSV, TXT.`,
   };
 }
 
@@ -406,18 +439,170 @@ function decodeXmlEntities(input: string): string {
 }
 
 function extractTextFromWordXml(xml: string): string {
-  const withBreaks = xml
-    .replace(/<\/w:tc>/g, '\t')
-    .replace(/<\/w:tr>/g, '\n')
+  // Strip DrawingML fallback blocks so textbox contents aren't duplicated
+  const cleanedXml = xml.replace(/<mc:Fallback[\s\S]*?<\/mc:Fallback>/gi, '');
+
+  // Format Word tables (<w:tbl>) cleanly row-by-row so columns remain aligned for extraction
+  const formattedTables = cleanedXml.replace(/<w:tbl\b[\s\S]*?<\/w:tbl>/gi, (tbl) => {
+    const rows = tbl.match(/<w:tr\b[\s\S]*?<\/w:tr>/gi) ?? [];
+    const lines: string[] = [];
+    for (const tr of rows) {
+      const cells = tr.match(/<w:tc\b[\s\S]*?<\/w:tc>/gi) ?? [];
+      const cellTexts = cells.map((tc) => {
+        const inner = tc
+          .replace(/<\/w:p>/g, ' ')
+          .replace(/<w:br[^>]*\/>/g, ' ')
+          .replace(/<w:tab[^>]*\/>/g, ' ')
+          .replace(/<[^>]+>/g, '');
+        return decodeXmlEntities(inner).replace(/\s+/g, ' ').trim();
+      });
+      if (cellTexts.some(Boolean)) {
+        lines.push(`| ${cellTexts.join(' | ')} |`);
+      }
+    }
+    return lines.length > 0 ? `\n${lines.join('\n')}\n` : '';
+  });
+
+  const withBreaks = formattedTables
     .replace(/<\/w:p>/g, '\n')
     .replace(/<w:br[^>]*\/>/g, '\n')
-    .replace(/<w:tab[^>]*\/>/g, '\t')
+    .replace(/<w:tab[^>]*\/>/g, ' | ')
     .replace(/<[^>]+>/g, '');
 
   return decodeXmlEntities(withBreaks)
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+function extractReadableTextFromLegacyDoc(bytes: Uint8Array): string {
+  // Best-effort readable run extractor from OLE2 .doc binary when LibreOffice converter is absent
+  const runs: string[] = [];
+  let asciiRun = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if ((b >= 32 && b <= 126) || b === 9 || b === 10 || b === 13) {
+      asciiRun += b === 13 ? '\n' : String.fromCharCode(b);
+    } else {
+      if (asciiRun.trim().length >= 8 && /[A-Za-z0-9]{4,}/.test(asciiRun)) {
+        runs.push(asciiRun.trim());
+      }
+      asciiRun = '';
+    }
+  }
+  if (asciiRun.trim().length >= 8 && /[A-Za-z0-9]{4,}/.test(asciiRun)) {
+    runs.push(asciiRun.trim());
+  }
+
+  // Also scan UTF-16LE runs (standard Word Unicode text storage)
+  let utf16Run = '';
+  for (let i = 0; i + 1 < bytes.length; i += 2) {
+    const code = bytes[i] | (bytes[i + 1] << 8);
+    if ((code >= 32 && code <= 126) || code === 9 || code === 10 || code === 13) {
+      utf16Run += code === 13 ? '\n' : String.fromCharCode(code);
+    } else {
+      if (utf16Run.trim().length >= 8 && /[A-Za-z0-9]{4,}/.test(utf16Run)) {
+        runs.push(utf16Run.trim());
+      }
+      utf16Run = '';
+    }
+  }
+  if (utf16Run.trim().length >= 8 && /[A-Za-z0-9]{4,}/.test(utf16Run)) {
+    runs.push(utf16Run.trim());
+  }
+
+  const filtered = Array.from(new Set(runs)).filter(
+    (r) =>
+      !/^(Root Entry|WordDocument|1Table|0Table|SummaryInformation|DocumentSummaryInformation|Microsoft Word|Normal\.dotm)/i.test(
+        r
+      )
+  );
+  return filtered.join('\n').trim();
+}
+
+function parseSharedStringsXml(xml: string): string[] {
+  const strings: string[] = [];
+  const siMatches = xml.match(/<si\b[\s\S]*?<\/si>/gi) ?? [];
+  for (const si of siMatches) {
+    const stripped = si.replace(/<[^>]+>/g, '');
+    strings.push(decodeXmlEntities(stripped));
+  }
+  return strings;
+}
+
+export function unpackExcelSpreadsheet(params: {
+  bytes: Uint8Array;
+  fileName: string;
+  sourceArchive?: string;
+}): { items: UnpackedExtractItem[]; skipped: SkippedArchiveEntry[] } {
+  const { bytes, fileName, sourceArchive } = params;
+  const tracker = { totalEntries: 0, totalUncompressedBytes: 0 };
+  const entries = readZipEntriesSafely({
+    zipBytes: bytes,
+    maxSingleEntryBytes: 25 * 1024 * 1024,
+    tracker,
+  });
+
+  let sharedStrings: string[] = [];
+  const sheetEntries: RawZipEntry[] = [];
+
+  for (const entry of entries) {
+    const lower = entry.name.toLowerCase();
+    if (lower === 'xl/sharedstrings.xml') {
+      sharedStrings = parseSharedStringsXml(new TextDecoder('utf-8').decode(entry.bytes));
+    } else if (/^xl\/worksheets\/sheet\d+\.xml$/.test(lower)) {
+      sheetEntries.push(entry);
+    }
+  }
+
+  const sheetTexts: string[] = [];
+  for (const sheet of sheetEntries) {
+    const xml = new TextDecoder('utf-8').decode(sheet.bytes);
+    const rows = xml.match(/<row\b[\s\S]*?<\/row>/gi) ?? [];
+    const lines: string[] = [];
+    for (const row of rows) {
+      const cells = row.match(/<c\b[\s\S]*?<\/c>/gi) ?? [];
+      const vals: string[] = [];
+      for (const cell of cells) {
+        const typeMatch = cell.match(/\bt="([^"]+)"/);
+        const cellType = typeMatch?.[1] ?? '';
+        let val = '';
+        if (cellType === 'inlineStr') {
+          val = decodeXmlEntities(cell.replace(/<[^>]+>/g, '')).trim();
+        } else {
+          const vMatch = cell.match(/<v>([\s\S]*?)<\/v>/i);
+          const rawVal = vMatch ? decodeXmlEntities(vMatch[1]).trim() : '';
+          if (cellType === 's') {
+            const idx = Number.parseInt(rawVal, 10);
+            val = Number.isFinite(idx) && sharedStrings[idx] !== undefined ? sharedStrings[idx] : rawVal;
+          } else {
+            val = rawVal;
+          }
+        }
+        if (val) vals.push(val);
+      }
+      if (vals.length > 0) lines.push(`| ${vals.join(' | ')} |`);
+    }
+    if (lines.length > 0) sheetTexts.push(lines.join('\n'));
+  }
+
+  const combined = sheetTexts.join('\n\n').trim();
+  if (!combined) {
+    throw new ArchiveExtractionError('XLSX spreadsheet contained no readable cell data.', 400);
+  }
+
+  return {
+    items: [
+      {
+        fileName,
+        mimeType: 'text/plain',
+        bytes: new TextEncoder().encode(combined),
+        kind: 'text',
+        sourceArchive,
+      },
+    ],
+    skipped: [],
+  };
 }
 
 async function convertWordToPdfViaService(params: {
@@ -488,8 +673,23 @@ export async function unpackWordDocument(params: {
   }
 
   if (ext === 'doc') {
+    const legacyText = extractReadableTextFromLegacyDoc(bytes);
+    if (legacyText.replace(/\s+/g, '').length >= 10) {
+      return {
+        items: [
+          {
+            fileName,
+            mimeType: 'text/plain',
+            bytes: new TextEncoder().encode(legacyText),
+            kind: 'text',
+            sourceArchive,
+          },
+        ],
+        skipped: [],
+      };
+    }
     throw new ArchiveExtractionError(
-      'Legacy .doc files require Word-to-PDF converter service. Please save as .docx or .pdf and upload again.',
+      'Legacy .doc file could not be read cleanly without Word-to-PDF converter. Please save as .docx or .pdf and upload again.',
       400
     );
   }
@@ -501,7 +701,7 @@ export async function unpackWordDocument(params: {
     tracker,
   });
 
-  const items: UnpackedExtractItem[] = [];
+  const mediaCandidates: UnpackedExtractItem[] = [];
   const skipped: SkippedArchiveEntry[] = [];
   const textSegments: string[] = [];
   const baseDocName = fileName.replace(/\.docx$/i, '');
@@ -513,7 +713,7 @@ export async function unpackWordDocument(params: {
       const mime = detectImageMime(entry.bytes, mediaExt);
       if (mime) {
         const mediaBase = entry.name.split('/').pop() || `image.${mediaExt}`;
-        items.push({
+        mediaCandidates.push({
           fileName: `${baseDocName}/${mediaBase}`,
           mimeType: mime,
           bytes: entry.bytes,
@@ -526,7 +726,10 @@ export async function unpackWordDocument(params: {
       continue;
     }
 
-    if (lower === 'word/document.xml' || /^word\/(header|footer)\d*\.xml$/.test(lower)) {
+    if (
+      lower === 'word/document.xml' ||
+      /^word\/(document\d*|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(lower)
+    ) {
       const xmlText = new TextDecoder('utf-8').decode(entry.bytes);
       const extracted = extractTextFromWordXml(xmlText);
       if (extracted) textSegments.push(extracted);
@@ -534,15 +737,25 @@ export async function unpackWordDocument(params: {
   }
 
   const combinedText = textSegments.join('\n').trim();
-  // Include extracted document text when no embedded photos exist, or when substantial text is present alongside photos
-  if (combinedText && (items.length === 0 || combinedText.replace(/\s+/g, '').length >= 30)) {
+  const compactLen = combinedText.replace(/\s+/g, '').length;
+  const items: UnpackedExtractItem[] = [];
+
+  // When meaningful document text/table exists, keep text and ignore tiny (<8KB) decorative logo icons
+  if (compactLen >= 5) {
     items.push({
-      fileName: `${baseDocName}.txt`,
+      fileName,
       mimeType: 'text/plain',
       bytes: new TextEncoder().encode(combinedText),
       kind: 'text',
       sourceArchive,
     });
+    for (const img of mediaCandidates) {
+      if (compactLen < 20 || img.bytes.byteLength >= 8 * 1024) {
+        items.push(img);
+      }
+    }
+  } else {
+    items.push(...mediaCandidates);
   }
 
   if (items.length === 0) {
@@ -642,6 +855,24 @@ export async function unpackZipArchive(params: {
         skipped.push({
           fileName: entry.name,
           reason: err instanceof Error ? err.message : 'Unable to unpack Word document.',
+        });
+      }
+      continue;
+    }
+
+    if (check.spec.kind === 'xlsx') {
+      try {
+        const xlRes = unpackExcelSpreadsheet({
+          bytes: entry.bytes,
+          fileName: entry.name,
+          sourceArchive: archiveName,
+        });
+        items.push(...xlRes.items);
+        skipped.push(...xlRes.skipped);
+      } catch (err) {
+        skipped.push({
+          fileName: entry.name,
+          reason: err instanceof Error ? err.message : 'Unable to read XLSX spreadsheet.',
         });
       }
       continue;

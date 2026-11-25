@@ -133,11 +133,26 @@ export function formatBytes(bytes: number): string {
 
 export const EXTRACT_UPLOAD_RULES = {
   accept:
-    '.jpg,.jpeg,.png,.webp,.heic,.heif,.pdf,.zip,.doc,.docx,image/jpeg,image/png,image/webp,image/heic,image/heif,application/pdf,application/zip,application/x-zip-compressed,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  extensions: ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'pdf', 'zip', 'docx', 'doc'] as const,
+    '.jpg,.jpeg,.png,.webp,.heic,.heif,.pdf,.zip,.doc,.docx,.xlsx,.csv,.txt,image/jpeg,image/png,image/webp,image/heic,image/heif,application/pdf,application/zip,application/x-zip-compressed,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,text/plain',
+  extensions: [
+    'jpg',
+    'jpeg',
+    'png',
+    'webp',
+    'heic',
+    'heif',
+    'pdf',
+    'zip',
+    'docx',
+    'doc',
+    'xlsx',
+    'csv',
+    'txt',
+  ] as const,
   imageExtensions: ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'] as const,
   maxImageBytes: 20 * 1024 * 1024,
   maxDocBytes: 25 * 1024 * 1024,
+  maxTextBytes: 10 * 1024 * 1024,
 } as const;
 
 export function validateExtractFile(
@@ -148,7 +163,7 @@ export function validateExtractFile(
   if (!ext || !(EXTRACT_UPLOAD_RULES.extensions as readonly string[]).includes(ext)) {
     return {
       ok: false,
-      error: `Unsupported file type "${file.name}". Allowed: JPG, JPEG, PNG, WEBP, HEIC, PDF, ZIP, DOCX.`,
+      error: `Unsupported file type "${file.name}". Allowed: JPG, JPEG, PNG, WEBP, HEIC, PDF, ZIP, DOCX, XLSX, CSV, TXT.`,
     };
   }
   if (file.size <= 0) {
@@ -163,9 +178,16 @@ export function validateExtractFile(
     return { ok: true, ext };
   }
 
-  if (ext === 'doc' || ext === 'docx') {
+  if (ext === 'doc' || ext === 'docx' || ext === 'xlsx') {
     if (file.size > EXTRACT_UPLOAD_RULES.maxDocBytes) {
       return { ok: false, error: `"${file.name}" exceeds the 25 MB document size limit.` };
+    }
+    return { ok: true, ext };
+  }
+
+  if (ext === 'csv' || ext === 'txt') {
+    if (file.size > EXTRACT_UPLOAD_RULES.maxTextBytes) {
+      return { ok: false, error: `"${file.name}" exceeds the 10 MB text/CSV size limit.` };
     }
     return { ok: true, ext };
   }
