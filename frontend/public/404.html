@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Redirecting — Captain Azhar Center</title>
+    <script>
+      // HashRouter SPA fallback for GitHub Pages deep links
+      (function () {
+        var l = window.location;
+        var base = l.pathname.split('/').slice(0, 2).join('/');
+        var rest = l.pathname.slice(base.length) + l.search;
+        var hash = l.hash || (rest && rest !== '/' ? '#' + rest : '#/');
+        l.replace(l.origin + base + '/' + hash);
+      })();
+    </script>
+  </head>
+  <body></body>
+</html>

@@ -1,0 +1,251 @@
+import type { InputTab } from './fileCheck';
+
+export const API_BASE_URL = (
+  import.meta.env.VITE_API_URL ||
+  (import.meta.env.PROD
+    ? 'https://captain-azhar-center.kashaf-hub.workers.dev'
+    : 'http://127.0.0.1:8787')
+).replace(/\/+$/, '');
+
+export const TURNSTILE_SITE_KEY = (import.meta.env.VITE_TURNSTILE_SITE_KEY || '').trim();
+const CSRF_HEADER_VALUE = 'CaptainAzharAdmin';
+
+export interface CreatedQrRecord {
+  id: string;
+  type: InputTab;
+  shortUrl: string;
+  deleteToken: string;
+  originalName?: string;
+  targetUrl?: string;
+  sizeBytes?: number;
+  createdAt: number;
+}
+
+export async function createShortLink(url: string, turnstileToken: string): Promise<CreatedQrRecord> {
+  const res = await fetch(`${API_BASE_URL}/api/link`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, turnstileToken }),
+  });
+  const data = (await res.json()) as CreatedQrRecord & { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || 'Could not create short link.');
+  }
+  return data;
+}
+
+export function uploadFileWithProgress(params: {
+  file: File;
+  category: Exclude<InputTab, 'link'>;
+  turnstileToken: string;
+  onProgress: (pct: number) => void;
+}): Promise<CreatedQrRecord> {
+  const { file, category, turnstileToken, onProgress } = params;
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE_URL}/api/upload`, true);
+
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+    xhr.setRequestHeader('X-File-Category', category);
+    xhr.setRequestHeader('X-Turnstile-Token', turnstileToken);
+
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && ev.total > 0) {
+        onProgress(Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
+      }
+    };
+
+    xhr.onload = () => {
+      try {
+        const parsed = JSON.parse(xhr.responseText || '{}') as CreatedQrRecord & { error?: string };
+        if (xhr.status >= 200 && xhr.status < 300) {
+          onProgress(100);
+          resolve(parsed);
+        } else {
+          reject(new Error(parsed.error || `Upload failed (${xhr.status})`));
+        }
+      } catch {
+        reject(new Error(`Upload failed (${xhr.status})`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error('Network error while uploading file.'));
+    xhr.onabort = () => reject(new Error('Upload was cancelled.'));
+
+    xhr.send(file);
+  });
+}
+
+export async function deleteUploadedItem(id: string, deleteToken: string): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}/api/f/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Delete-Token': deleteToken,
+    },
+    body: JSON.stringify({ deleteToken }),
+  });
+  const data = (await res.json().catch(() => ({}))) as { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || 'Could not delete item.');
+  }
+}
+
+export async function submitAbuseReport(idOrUrl: string, reason: string): Promise<string> {
+  const res = await fetch(`${API_BASE_URL}/api/report`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idOrUrl, reason }),
+  });
+  const data = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to submit report.');
+  }
+  return data.message || 'Report submitted.';
+}
+
+// ---- Admin API Client ----
+
+async function adminFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const method = (options.method ?? 'GET').toUpperCase();
+  const headers = new Headers(options.headers);
+  if (!headers.has('Content-Type') && options.body) {
+    headers.set('Content-Type', 'application/json');
+  }
+  if (method !== 'GET' && method !== 'HEAD') {
+    headers.set('X-Requested-With', CSRF_HEADER_VALUE);
+  }
+
+  const res = await fetch(`${API_BASE_URL}/api/admin${path}`, {
+    ...options,
+    credentials: 'include',
+    headers,
+  });
+
+  const data = (await res.json().catch(() => ({}))) as T & { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || `Request failed (${res.status})`);
+  }
+  return data;
+}
+
+export const adminApi = {
+  bootstrap: () => adminFetch<{ initialized: boolean }>('/bootstrap'),
+  signup: (email: string, password: string, turnstileToken: string) =>
+    adminFetch<{ ok: boolean; email: string }>('/signup', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, turnstileToken }),
+    }),
+  login: (email: string, password: string, turnstileToken: string) =>
+    adminFetch<{ ok: boolean; email: string }>('/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, turnstileToken }),
+    }),
+  logout: () => adminFetch<{ ok: boolean }>('/logout', { method: 'POST', body: '{}' }),
+  forgot: (email: string, turnstileToken: string) =>
+    adminFetch<{ ok: boolean; message: string }>('/forgot', {
+      method: 'POST',
+      body: JSON.stringify({ email, turnstileToken }),
+    }),
+  reset: (token: string, newPassword: string) =>
+    adminFetch<{ ok: boolean; message: string }>('/reset', {
+      method: 'POST',
+      body: JSON.stringify({ token, newPassword }),
+    }),
+  me: () => adminFetch<{ authenticated: boolean; email: string }>('/me'),
+  stats: () =>
+    adminFetch<{
+      totalBytes: number;
+      limitBytes: number;
+      percentUsed: number;
+      triggerPct: number;
+      targetPct: number;
+      expireLinksMonths: number | null;
+      countsByType: Record<string, number>;
+      oldestActiveFileDate: number | null;
+      unresolvedReportsCount: number;
+      cleanupLogs: Array<{
+        id: number;
+        run_time: number;
+        files_deleted: number;
+        bytes_freed: number;
+        total_after: number;
+        trigger: string;
+      }>;
+      loginAttempts: Array<{
+        id: number;
+        time: number;
+        ip: string;
+        success: number;
+      }>;
+    }>('/stats'),
+  files: (params: { q?: string; type?: string; status?: string; page?: number }) => {
+    const qs = new URLSearchParams();
+    if (params.q) qs.set('q', params.q);
+    if (params.type) qs.set('type', params.type);
+    if (params.status) qs.set('status', params.status);
+    if (params.page) qs.set('page', String(params.page));
+    return adminFetch<{
+      items: Array<{
+        id: string;
+        type: string;
+        original_name: string | null;
+        mime_type: string | null;
+        size_bytes: number;
+        target_url: string | null;
+        created_at: number;
+        status: string;
+        removed_reason: string | null;
+      }>;
+      total: number;
+      page: number;
+      pageSize: number;
+    }>(`/files?${qs.toString()}`);
+  },
+  deleteFile: (id: string) => adminFetch<{ ok: boolean }>(`/f/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  blockItem: (id: string, action: 'block' | 'unblock') =>
+    adminFetch<{ ok: boolean; status: string }>(`/block/${encodeURIComponent(id)}`, {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+    }),
+  runCleanup: () =>
+    adminFetch<{
+      ok: boolean;
+      ran: boolean;
+      filesDeleted: number;
+      bytesFreed: number;
+      totalAfter: number;
+    }>('/cleanup', { method: 'POST', body: '{}' }),
+  reports: () =>
+    adminFetch<{
+      reports: Array<{
+        id: number;
+        file_id: string;
+        reason: string;
+        time: number;
+        resolved: number;
+        type?: string;
+        original_name?: string;
+        target_url?: string;
+        item_status?: string;
+      }>;
+    }>('/reports'),
+  resolveReport: (id: number) =>
+    adminFetch<{ ok: boolean }>(`/reports/${id}/resolve`, { method: 'POST', body: '{}' }),
+  updateSettings: (payload: {
+    triggerPct?: number;
+    targetPct?: number;
+    expireLinksMonths?: number | null;
+  }) =>
+    adminFetch<{
+      ok: boolean;
+      triggerPct: number;
+      targetPct: number;
+      expireLinksMonths: number | null;
+    }>('/settings', {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+};

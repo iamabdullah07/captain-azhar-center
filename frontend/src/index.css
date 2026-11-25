@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --brand-navy: #0A1832;
+    --brand-navy-light: #13294B;
+    --brand-gold: #D9A441;
+    --brand-gold-soft: #FEF3C7;
+  }
+
+  body {
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: linear-gradient(180deg, #F8FAFC 0%, #EFF4FA 100%);
+    min-height: 100vh;
+    color: #0A1832;
+  }
+}

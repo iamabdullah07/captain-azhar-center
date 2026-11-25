@@ -1,0 +1,35 @@
+name = "captain-azhar-center"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+workers_dev = true
+
+# R2 Private Bucket binding (never attach public r2.dev domain in production)
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "captain-azhar-files"
+
+# D1 SQLite Database binding (replace database_id after running: npx wrangler d1 create captain-azhar-db)
+[[d1_databases]]
+binding = "DB"
+database_name = "captain-azhar-db"
+database_id = "8ca4cd83-389a-4a47-bec4-72db1b3e3fdc"
+migrations_dir = "migrations"
+
+# Daily safety-net cleanup & 70% storage alert (02:00 UTC)
+[triggers]
+crons = ["0 2 * * *"]
+
+[vars]
+# Comma-separated allowed origins (matches git user.name iamabdullah07; update if repo/user differs)
+ALLOWED_ORIGINS = "https://iamabdullah07.github.io"
+FRONTEND_URL = "https://iamabdullah07.github.io/captain-azhar-center"
+EMAIL_PROVIDER = "resend"
+EMAIL_FROM = "Captain Azhar Center <onboarding@resend.dev>"
+APP_NAME = "Captain Azhar Center"
+SAME_ORIGIN_COOKIES = "false"
+
+# Secrets to configure with `npx wrangler secret put <NAME>`:
+# - ADMIN_EMAIL            (owner email — kept in Worker secrets so public repo stays clean)
+# - SESSION_SECRET         (random 64+ hex char signing key)
+# - EMAIL_API_KEY          (Resend or Brevo API key)
+# - TURNSTILE_SECRET_KEY   (Cloudflare Turnstile secret key)

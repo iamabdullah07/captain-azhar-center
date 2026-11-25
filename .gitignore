@@ -1,0 +1,27 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Environment & secrets (NEVER commit secrets)
+.env
+.env.*
+!.env.example
+.dev.vars
+*.pem
+*.key
+
+# Cloudflare Wrangler local state & exports
+.wrangler/
+worker/.wrangler/
+*.sqlite
+*.db
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+npm-debug.log*
