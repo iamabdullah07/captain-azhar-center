@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   AlertTriangle,
   FilePenLine,
@@ -46,6 +47,13 @@ import {
   type QrErrorCorrection,
   type QrSizeOption,
 } from '../lib/qrEngine';
+import {
+  loadHomeSection,
+  loadQrGeneratorPrefs,
+  saveHomeSection,
+  saveQrGeneratorPrefs,
+  type HomeSection,
+} from '../lib/homePrefs';
 
 const TABS: Array<{ id: InputTab; label: string; icon: typeof Link2 }> = [
   { id: 'link', label: 'Link', icon: Link2 },
@@ -68,19 +76,21 @@ function saveRecentRecord(record: CreatedQrRecord) {
 }
 
 export function HomePage() {
-  const [homeSection, setHomeSection] = useState<'generate' | 'edit-file' | 'extract-data'>(
-    'generate'
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [homeSection, setHomeSection] = useState<HomeSection>(() =>
+    loadHomeSection(searchParams.get('section'))
   );
-  const [activeTab, setActiveTab] = useState<InputTab>('link');
+  const initialQrPrefs = useMemo(() => loadQrGeneratorPrefs(), []);
+  const [activeTab, setActiveTab] = useState<InputTab>(initialQrPrefs.activeTab);
   const [urlInput, setUrlInput] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [dragActive, setDragActive] = useState(false);
 
-  const [sizePx, setSizePx] = useState<QrSizeOption>(300);
-  const [ecl, setEcl] = useState<QrErrorCorrection>('M');
-  const [fgColor, setFgColor] = useState('#0A1832');
-  const [bgColor, setBgColor] = useState('#FFFFFF');
-  const [safeMargin, setSafeMargin] = useState(true);
+  const [sizePx, setSizePx] = useState<QrSizeOption>(initialQrPrefs.sizePx);
+  const [ecl, setEcl] = useState<QrErrorCorrection>(initialQrPrefs.ecl);
+  const [fgColor, setFgColor] = useState(initialQrPrefs.fgColor);
+  const [bgColor, setBgColor] = useState(initialQrPrefs.bgColor);
+  const [safeMargin, setSafeMargin] = useState(initialQrPrefs.safeMargin);
 
   const [turnstileToken, setTurnstileToken] = useState('');
   const [turnstileResetKey, setTurnstileResetKey] = useState(0);
@@ -96,6 +106,34 @@ export function HomePage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const contrast = useMemo(() => evaluateQrContrast(fgColor, bgColor), [fgColor, bgColor]);
+
+  // Keep active section synced with URL query param & storage across reloads
+  useEffect(() => {
+    saveHomeSection(homeSection);
+    const currentUrlSection = searchParams.get('section');
+    if (homeSection === 'generate') {
+      if (currentUrlSection !== null) {
+        const next = new URLSearchParams(searchParams);
+        next.delete('section');
+        setSearchParams(next, { replace: true });
+      }
+    } else if (currentUrlSection !== homeSection) {
+      const next = new URLSearchParams(searchParams);
+      next.set('section', homeSection);
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [homeSection]);
+
+  // Persist Section 1 input tab and QR customization settings across reloads
+  useEffect(() => {
+    saveQrGeneratorPrefs({ activeTab, sizePx, ecl, fgColor, bgColor, safeMargin });
+  }, [activeTab, sizePx, ecl, fgColor, bgColor, safeMargin]);
+
+  const handleSectionChange = (section: HomeSection) => {
+    saveHomeSection(section);
+    setHomeSection(section);
+  };
 
   // Warm API connection on mount so HTTP/2 fallback settles before user uploads
   useEffect(() => {
@@ -123,6 +161,7 @@ export function HomePage() {
 
   const handleTabChange = (tab: InputTab) => {
     setActiveTab(tab);
+    saveQrGeneratorPrefs({ activeTab: tab, sizePx, ecl, fgColor, bgColor, safeMargin });
     setSelectedFile(null);
     setRecord(null);
     setAssets(null);
@@ -291,7 +330,7 @@ export function HomePage() {
               type="button"
               role="tab"
               aria-selected={homeSection === 'generate'}
-              onClick={() => setHomeSection('generate')}
+              onClick={() => handleSectionChange('generate')}
               className={`flex items-center justify-center gap-2 py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
                 homeSection === 'generate'
                   ? 'bg-[#0A1832] text-[#D9A441] shadow-sm'
@@ -305,7 +344,7 @@ export function HomePage() {
               type="button"
               role="tab"
               aria-selected={homeSection === 'edit-file'}
-              onClick={() => setHomeSection('edit-file')}
+              onClick={() => handleSectionChange('edit-file')}
               className={`flex items-center justify-center gap-2 py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
                 homeSection === 'edit-file'
                   ? 'bg-[#0A1832] text-[#D9A441] shadow-sm'
@@ -319,7 +358,7 @@ export function HomePage() {
               type="button"
               role="tab"
               aria-selected={homeSection === 'extract-data'}
-              onClick={() => setHomeSection('extract-data')}
+              onClick={() => handleSectionChange('extract-data')}
               className={`flex items-center justify-center gap-2 py-2.5 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-bold transition cursor-pointer ${
                 homeSection === 'extract-data'
                   ? 'bg-[#0A1832] text-[#D9A441] shadow-sm'
@@ -515,7 +554,11 @@ export function HomePage() {
                   </label>
                   <select
                     value={sizePx}
-                    onChange={(e) => setSizePx(Number(e.target.value) as QrSizeOption)}
+                    onChange={(e) => {
+                      const next = Number(e.target.value) as QrSizeOption;
+                      setSizePx(next);
+                      saveQrGeneratorPrefs({ activeTab, sizePx: next, ecl, fgColor, bgColor, safeMargin });
+                    }}
                     className="w-full px-3 py-2.5 rounded-xl border border-slate-300 bg-white text-sm text-[#0A1832] focus:border-[#0A1832] outline-none"
                   >
                     {QR_SIZE_OPTIONS.map((opt) => (
@@ -532,7 +575,11 @@ export function HomePage() {
                   </label>
                   <select
                     value={ecl}
-                    onChange={(e) => setEcl(e.target.value as QrErrorCorrection)}
+                    onChange={(e) => {
+                      const next = e.target.value as QrErrorCorrection;
+                      setEcl(next);
+                      saveQrGeneratorPrefs({ activeTab, sizePx, ecl: next, fgColor, bgColor, safeMargin });
+                    }}
                     className="w-full px-3 py-2.5 rounded-xl border border-slate-300 bg-white text-sm text-[#0A1832] focus:border-[#0A1832] outline-none"
                   >
                     {QR_ECL_OPTIONS.map((opt) => (
@@ -551,14 +598,22 @@ export function HomePage() {
                     <input
                       type="color"
                       value={/^#[0-9a-fA-F]{6}$/.test(fgColor) ? fgColor : '#0A1832'}
-                      onChange={(e) => setFgColor(e.target.value.toUpperCase())}
+                      onChange={(e) => {
+                        const next = e.target.value.toUpperCase();
+                        setFgColor(next);
+                        saveQrGeneratorPrefs({ activeTab, sizePx, ecl, fgColor: next, bgColor, safeMargin });
+                      }}
                       aria-label="Foreground color picker"
                       className="w-8 h-8 rounded border-0 cursor-pointer bg-transparent"
                     />
                     <input
                       type="text"
                       value={fgColor}
-                      onChange={(e) => setFgColor(e.target.value.toUpperCase())}
+                      onChange={(e) => {
+                        const next = e.target.value.toUpperCase();
+                        setFgColor(next);
+                        saveQrGeneratorPrefs({ activeTab, sizePx, ecl, fgColor: next, bgColor, safeMargin });
+                      }}
                       maxLength={7}
                       className="flex-1 text-sm font-mono text-[#0A1832] outline-none"
                     />
@@ -573,14 +628,22 @@ export function HomePage() {
                     <input
                       type="color"
                       value={/^#[0-9a-fA-F]{6}$/.test(bgColor) ? bgColor : '#FFFFFF'}
-                      onChange={(e) => setBgColor(e.target.value.toUpperCase())}
+                      onChange={(e) => {
+                        const next = e.target.value.toUpperCase();
+                        setBgColor(next);
+                        saveQrGeneratorPrefs({ activeTab, sizePx, ecl, fgColor, bgColor: next, safeMargin });
+                      }}
                       aria-label="Background color picker"
                       className="w-8 h-8 rounded border-0 cursor-pointer bg-transparent"
                     />
                     <input
                       type="text"
                       value={bgColor}
-                      onChange={(e) => setBgColor(e.target.value.toUpperCase())}
+                      onChange={(e) => {
+                        const next = e.target.value.toUpperCase();
+                        setBgColor(next);
+                        saveQrGeneratorPrefs({ activeTab, sizePx, ecl, fgColor, bgColor: next, safeMargin });
+                      }}
                       maxLength={7}
                       className="flex-1 text-sm font-mono text-[#0A1832] outline-none"
                     />
@@ -606,7 +669,11 @@ export function HomePage() {
                 <input
                   type="checkbox"
                   checked={safeMargin}
-                  onChange={(e) => setSafeMargin(e.target.checked)}
+                  onChange={(e) => {
+                    const next = e.target.checked;
+                    setSafeMargin(next);
+                    saveQrGeneratorPrefs({ activeTab, sizePx, ecl, fgColor, bgColor, safeMargin: next });
+                  }}
                   className="w-4 h-4 accent-[#D9A441] rounded"
                 />
                 <span>Add a safe white margin (recommended for printing &amp; scanning)</span>

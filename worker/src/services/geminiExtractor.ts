@@ -67,31 +67,41 @@ const EXTRACTION_DOC_ITEM_SCHEMA = {
       type: ['integer', 'null'],
       description: '1-based page number or table row index if multiple records exist, otherwise null.',
     },
+    arabic_name: {
+      type: ['string', 'null'],
+      description:
+        'Exact Arabic holder name next to الاسم / الإسم / الاسم الكامل / اسم المقيم / اسم العامل if Arabic appears (NEVER sponsor/employer الكفيل/صاحب العمل, profession المهنة, or headers), else null.',
+    },
     name: {
       type: ['string', 'null'],
       description:
-        'Full person name in UPPERCASE Latin letters. If both Arabic and English appear, take English only. Return null if unclear.',
+        'Holder full name in UPPERCASE Latin letters. If printed in English, copy the printed English holder name exactly. If only Arabic appears, transliterate arabic_name accurately into UPPERCASE Latin letters. Never return sponsor, profession, city, or card header text.',
     },
     passport_number: {
       type: ['string', 'null'],
-      description: 'Passport number without spaces or dashes if visible, else null.',
+      description: 'Passport number (رقم الجواز) in ASCII alphanumeric without spaces or dashes if visible, else null.',
     },
     iqama_number: {
       type: ['string', 'null'],
-      description: 'Saudi Iqama / Resident ID number without spaces or dashes if visible, else null.',
+      description: 'Saudi Iqama / Resident ID number (رقم الإقامة / هوية مقيم, typically 10 digits starting with 2) in ASCII digits without spaces or dashes if visible, else null.',
     },
     national_id_number: {
       type: ['string', 'null'],
-      description: 'National ID / CNIC / Aadhaar / Emirates ID number without spaces or dashes if visible, else null.',
+      description: 'National ID / Saudi National ID (رقم الهوية / السجل المدني, typically 10 digits starting with 1) / CNIC / Aadhaar / Emirates ID in ASCII digits without spaces or dashes if visible, else null.',
     },
     visa_number: {
       type: ['string', 'null'],
-      description: 'Visa number without spaces or dashes if visible, else null.',
+      description: 'Visa number (رقم التأشيرة) in ASCII alphanumeric without spaces or dashes if visible, else null.',
+    },
+    arabic_nationality: {
+      type: ['string', 'null'],
+      description:
+        'Exact Arabic nationality/country word next to الجنسية / البلد if Arabic appears (NEVER place of issue مكان الإصدار, religion الديانة, or Saudi header المملكة العربية السعودية unless holder is Saudi), else null.',
     },
     nationality: {
       type: ['string', 'null'],
       description:
-        'Nationality normalized as an UPPERCASE demonym (e.g., PAKISTANI, INDIAN, SAUDI, BANGLADESHI, FILIPINO, EGYPTIAN). Return null if uncertain.',
+        'Holder nationality normalized as an UPPERCASE English demonym (e.g., PAKISTANI, INDIAN, SAUDI, SUDANESE, BANGLADESHI, FILIPINO, EGYPTIAN, YEMENI, NEPALI, SYRIAN, JORDANIAN). Translate arabic_nationality accurately; return null if uncertain.',
     },
     confidence: {
       type: ['number', 'null'],
@@ -99,11 +109,13 @@ const EXTRACTION_DOC_ITEM_SCHEMA = {
     },
   },
   required: [
+    'arabic_name',
     'name',
     'passport_number',
     'iqama_number',
     'national_id_number',
     'visa_number',
+    'arabic_nationality',
     'nationality',
   ],
 } as const;
@@ -149,11 +161,11 @@ const BATCH_EXTRACTION_RESPONSE_JSON_SCHEMA = {
 } as const;
 
 const SHARED_EXTRACTION_RULES = [
-  '1. TABLES, SPREADSHEETS, PDFS & LISTS: If the input is a Word document, PDF, spreadsheet, CSV, or table containing multiple rows or people, extract EVERY person/row as a separate object (skip header/title/footer rows). If a multi-page PDF contains multiple people or identity documents across pages, return one separate object per person/document with its 1-based `page_number`.',
-  '2. NAME: Return the full name in Latin (English) UPPERCASE letters. If both Arabic and English names appear, strictly use the English name. Never guess unreadable names — return null.',
-  '3. ID NUMBERS: Extract every visible ID into its matching field (`passport_number`, `iqama_number`, `national_id_number`, `visa_number`) with all spaces and dashes removed. Match table columns accurately: Iqama -> `iqama_number`, Passport -> `passport_number`, National ID / CNIC -> `national_id_number`, Visa -> `visa_number`. Never invent or guess digits — return null if unreadable.',
-  '4. NATIONALITY: Return the nationality normalized as an UPPERCASE demonym (e.g., "PAKISTANI", "INDIAN", "SAUDI", "BANGLADESHI", "FILIPINO", "EGYPTIAN"). If a country name appears (like "Pakistan" or "India"), normalize it to "PAKISTANI" / "INDIAN". Return null if uncertain.',
-  '5. EMPTY / UNREADABLE: If a file has no readable identity details, return one empty record: `{"name": null, "passport_number": null, "iqama_number": null, "national_id_number": null, "visa_number": null, "nationality": null}`.',
+  '1. TABLES, SPREADSHEETS, PDFS & LISTS: If the input is a Word document, PDF, spreadsheet, CSV, or table containing multiple rows or people, extract EVERY person/row as a separate object (skip header/title/footer rows). In Arabic RTL tables and cards, labels sit to the right of or above their values. If a multi-page PDF contains multiple people or identity documents across pages, return one separate object per person/document with its 1-based `page_number`.',
+  '2. HOLDER NAME (`arabic_name` & `name`): Extract ONLY the person/holder name (labeled `Name`, `Full Name`, `الاسم`, `الإسم`, `الاسم الكامل`, `اسم المقيم`, `اسم العامل`, `اسم الموظف`, `اسم المسافر`, `اسم حامل الجواز`). NEVER pick sponsor/employer (`الكفيل`, `صاحب العمل`, `المؤسسة`, `الشركة`, `Sponsor`, `Employer`), profession (`المهنة`), religion (`الديانة`), city/place of issue (`مكان الإصدار`, `مكان الميلاد`), or document titles (`المملكة العربية السعودية`, `وزارة الداخلية`, `هوية مقيم`, `الهوية الوطنية`). Copy any Arabic holder name into `arabic_name`. For `name`, if English is printed for the holder, strictly use that English name in UPPERCASE; if ONLY Arabic appears, transliterate the full Arabic holder name accurately into UPPERCASE Latin letters (e.g., `محمد علي خان` -> `MUHAMMAD ALI KHAN`, `عبد الله` -> `ABDULLAH`). Never leave `name` null when a readable Arabic name is present.',
+  '3. ID NUMBERS: Extract every visible ID into its matching field (`passport_number`, `iqama_number`, `national_id_number`, `visa_number`) using Western ASCII digits `0-9` (convert any Eastern Arabic numerals `٠١٢٣٤٥٦٧٨٩` to `0-9`) with all spaces and dashes removed. Match labels accurately: `Passport` / `رقم الجواز` -> `passport_number`; `Iqama` / `رقم الإقامة` / `هوية مقيم` (10 digits starting with `2`) -> `iqama_number`; `National ID` / `CNIC` / `Emirates ID` / `رقم الهوية` / `السجل المدني` / `الهوية الوطنية` (Saudi IDs start with `1`) -> `national_id_number`; `Visa` / `رقم التأشيرة` -> `visa_number`. Do not confuse birth/expiry dates with ID numbers. Never invent digits — return null if unreadable.',
+  '4. NATIONALITY (`arabic_nationality` & `nationality`): Look specifically at the `Nationality` / `الجنسية` / `جنسية` / `البلد` field. Copy any Arabic nationality/country word into `arabic_nationality`. Normalize `nationality` as an UPPERCASE English demonym (e.g., `PAKISTANI`, `INDIAN`, `SAUDI`, `SUDANESE`, `BANGLADESHI`, `FILIPINO`, `EGYPTIAN`, `YEMENI`, `NEPALI`, `SRI LANKAN`, `SYRIAN`, `JORDANIAN`, `ETHIOPIAN`, `INDONESIAN`). Translate Arabic nationalities accurately (e.g., `باكستاني`/`باكستان` -> `PAKISTANI`, `هندي`/`الهند` -> `INDIAN`, `سوداني`/`السودان` -> `SUDANESE`, `بنغلاديشي` -> `BANGLADESHI`, `مصري` -> `EGYPTIAN`, `يمني` -> `YEMENI`, `نيبالي` -> `NEPALI`, `فلبيني` -> `FILIPINO`). CRITICAL FOR SAUDI CARDS: `المملكة العربية السعودية` / `Kingdom of Saudi Arabia` at the top is the issuing country, NOT the holder nationality; never return `SAUDI` from the header, city (`الرياض`/`جدة`/`الدمام`), or religion (`مسلم`) unless `الجنسية` says `سعودي`/`السعودية` or the document is explicitly a Saudi National ID (`الهوية الوطنية` with `1xxxxxxxxx` ID and no foreign nationality).',
+  '5. EMPTY / UNREADABLE: If a file has no readable identity details, return one empty record: `{"arabic_name": null, "name": null, "passport_number": null, "iqama_number": null, "national_id_number": null, "visa_number": null, "arabic_nationality": null, "nationality": null}`.',
 ];
 
 const EXTRACTION_PROMPT = [
@@ -173,6 +185,46 @@ const BATCH_EXTRACTION_PROMPT = [
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function decodeTextBytesSmart(bytes: Uint8Array): string {
+  if (bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+  if (bytes.byteLength >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return new TextDecoder('utf-16le').decode(bytes);
+  }
+  if (bytes.byteLength >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return new TextDecoder('utf-16be').decode(bytes);
+  }
+
+  // Detect BOM-less UTF-16LE (common in Windows/Excel Arabic text exports)
+  if (bytes.byteLength >= 4 && bytes.byteLength % 2 === 0) {
+    const samplePairs = Math.min(80, Math.floor(bytes.byteLength / 2));
+    let utf16LikePairs = 0;
+    for (let i = 0; i < samplePairs * 2; i += 2) {
+      if ((bytes[i + 1] === 0x00 || bytes[i + 1] === 0x06) && bytes[i] !== 0x00) {
+        utf16LikePairs += 1;
+      }
+    }
+    if (utf16LikePairs >= samplePairs * 0.45) {
+      try {
+        return new TextDecoder('utf-16le').decode(bytes);
+      } catch {
+        // Fall through
+      }
+    }
+  }
+
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes);
+  } catch {
+    try {
+      return new TextDecoder('windows-1256').decode(bytes);
+    } catch {
+      return new TextDecoder('utf-8').decode(bytes);
+    }
+  }
 }
 
 export function encodeUint8ToBase64(bytes: Uint8Array): string {
@@ -751,7 +803,7 @@ export async function extractDocumentWithGemini(params: {
 
   try {
     if (isPlainText) {
-      cachedPlainText = new TextDecoder('utf-8').decode(await loadBytes());
+      cachedPlainText = decodeTextBytesSmart(await loadBytes());
     } else if (useInline) {
       cachedInlineBase64 = encodeUint8ToBase64(await loadBytes());
     }
@@ -860,7 +912,7 @@ export async function extractBatchWithGemini(params: {
     });
     const bytes = await item.loadBytes();
     if (item.mimeType === 'text/plain') {
-      staticParts.push({ text: new TextDecoder('utf-8').decode(bytes) });
+      staticParts.push({ text: decodeTextBytesSmart(bytes) });
     } else {
       staticParts.push({
         inlineData: {

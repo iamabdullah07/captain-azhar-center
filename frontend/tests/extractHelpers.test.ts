@@ -74,6 +74,32 @@ describe('Phase 2-4 Frontend Extract Helpers & Validation', () => {
       selectedModel: 'gemini-3.6-flash',
       allowFallback: true,
     });
+
+    // Falls back to sessionStorage when localStorage throws
+    const sessionMap = new Map<string, string>();
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      value: {
+        getItem: (k: string) => sessionMap.get(k) ?? null,
+        setItem: (k: string, v: string) => sessionMap.set(k, v),
+      },
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: {
+        getItem: () => {
+          throw new Error('Blocked');
+        },
+        setItem: () => {
+          throw new Error('Blocked');
+        },
+      },
+      configurable: true,
+    });
+    saveExtractModelPrefs({ selectedModel: 'gemini-3.5-flash-lite', allowFallback: false });
+    expect(loadExtractModelPrefs()).toEqual({
+      selectedModel: 'gemini-3.5-flash-lite',
+      allowFallback: false,
+    });
   });
 
   it('formats compact token counts and computes green/yellow/red quota tube colors', () => {

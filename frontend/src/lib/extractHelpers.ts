@@ -48,13 +48,30 @@ export const DEFAULT_GEMINI_MODELS = [
   { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', priority: 3, description: 'Secondary fallback' },
 ] as const;
 
+function readPrefsStorage(key: string): string | null {
+  try {
+    const val = localStorage.getItem(key);
+    if (val !== null) return val;
+  } catch {
+    // Ignore localStorage read errors
+  }
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 export function loadExtractModelPrefs(): ExtractModelPrefs {
   try {
-    const raw = localStorage.getItem(MODEL_PREFS_STORAGE_KEY);
+    const raw = readPrefsStorage(MODEL_PREFS_STORAGE_KEY);
     if (!raw) return { selectedModel: 'auto', allowFallback: false };
     const parsed = JSON.parse(raw) as Partial<ExtractModelPrefs>;
     return {
-      selectedModel: typeof parsed.selectedModel === 'string' && parsed.selectedModel ? parsed.selectedModel : 'auto',
+      selectedModel:
+        typeof parsed.selectedModel === 'string' && parsed.selectedModel.trim()
+          ? parsed.selectedModel.trim()
+          : 'auto',
       allowFallback: Boolean(parsed.allowFallback),
     };
   } catch {
@@ -63,8 +80,17 @@ export function loadExtractModelPrefs(): ExtractModelPrefs {
 }
 
 export function saveExtractModelPrefs(prefs: ExtractModelPrefs): void {
+  const payload = JSON.stringify({
+    selectedModel: prefs.selectedModel.trim() || 'auto',
+    allowFallback: Boolean(prefs.allowFallback),
+  });
   try {
-    localStorage.setItem(MODEL_PREFS_STORAGE_KEY, JSON.stringify(prefs));
+    localStorage.setItem(MODEL_PREFS_STORAGE_KEY, payload);
+  } catch {
+    // Ignore storage errors
+  }
+  try {
+    sessionStorage.setItem(MODEL_PREFS_STORAGE_KEY, payload);
   } catch {
     // Ignore storage errors
   }

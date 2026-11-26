@@ -242,6 +242,13 @@ export function AllFilesDataSection() {
         if (!mounted) return;
         setConfig(cfg);
         if (cfg.quota) setQuota(cfg.quota);
+        if (
+          cfg.models?.length &&
+          modelPrefsRef.current.selectedModel !== 'auto' &&
+          !cfg.models.some((m) => m.id === modelPrefsRef.current.selectedModel)
+        ) {
+          setSelectedModel('auto');
+        }
         setConfigLoaded(true);
       })
       .catch(() => {
@@ -1095,7 +1102,11 @@ export function AllFilesDataSection() {
             <select
               id="extract-model-select"
               value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
+              onChange={(e) => {
+                const nextModel = e.target.value;
+                setSelectedModel(nextModel);
+                saveExtractModelPrefs({ selectedModel: nextModel, allowFallback });
+              }}
               className="px-3 py-2 rounded-xl border border-slate-300 bg-white text-xs sm:text-sm font-semibold text-[#0A1832] focus:border-[#0A1832] outline-none cursor-pointer"
             >
               <option value="auto">Auto (recommended)</option>
@@ -1112,7 +1123,11 @@ export function AllFilesDataSection() {
               <input
                 type="checkbox"
                 checked={allowFallback}
-                onChange={(e) => setAllowFallback(e.target.checked)}
+                onChange={(e) => {
+                  const nextFallback = e.target.checked;
+                  setAllowFallback(nextFallback);
+                  saveExtractModelPrefs({ selectedModel, allowFallback: nextFallback });
+                }}
                 className="w-3.5 h-3.5 accent-[#D9A441] rounded"
               />
               <span>Allow fallback</span>

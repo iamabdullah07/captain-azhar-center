@@ -1,7 +1,17 @@
+import {
+  containsArabicScript,
+  LATIN_NAME_BOILERPLATE,
+  LATIN_NON_NATIONALITY_DISTRACTORS,
+  lookupArabicNationalityDemonym,
+  normalizeEasternArabicDigits,
+  transliterateArabicNameToLatin,
+} from './arabicNormalization';
+
 export type ExtractedIdType = 'passport' | 'iqama' | 'national_id' | 'visa';
 
 export interface RawGeminiExtractedDoc {
   page_number?: number | null;
+  arabic_name?: string | null;
   name?: string | null;
   passport_number?: string | null;
   iqama_number?: string | null;
@@ -9,6 +19,7 @@ export interface RawGeminiExtractedDoc {
   visa_number?: string | null;
   id_number?: string | null;
   id_type?: string | null;
+  arabic_nationality?: string | null;
   nationality?: string | null;
   confidence?: number | null;
 }
@@ -263,8 +274,84 @@ const COUNTRY_TO_DEMONYM: Record<string, string> = {
   SEN: 'SENEGALESE',
   SN: 'SENEGALESE',
   SENEGALESE: 'SENEGALESE',
+  MAURITANIA: 'MAURITANIAN',
+  MRT: 'MAURITANIAN',
+  MR: 'MAURITANIAN',
+  MAURITANIAN: 'MAURITANIAN',
+  DJIBOUTI: 'DJIBOUTIAN',
+  DJI: 'DJIBOUTIAN',
+  DJ: 'DJIBOUTIAN',
+  DJIBOUTIAN: 'DJIBOUTIAN',
+  TANZANIA: 'TANZANIAN',
+  TZA: 'TANZANIAN',
+  TZ: 'TANZANIAN',
+  TANZANIAN: 'TANZANIAN',
+  CAMEROON: 'CAMEROONIAN',
+  CMR: 'CAMEROONIAN',
+  CM: 'CAMEROONIAN',
+  CAMEROONIAN: 'CAMEROONIAN',
+  GAMBIA: 'GAMBIAN',
+  GMB: 'GAMBIAN',
+  GM: 'GAMBIAN',
+  GAMBIAN: 'GAMBIAN',
+  GUINEA: 'GUINEAN',
+  GIN: 'GUINEAN',
+  GN: 'GUINEAN',
+  GUINEAN: 'GUINEAN',
+  'BURKINA FASO': 'BURKINABE',
+  BFA: 'BURKINABE',
+  BF: 'BURKINABE',
+  BURKINABE: 'BURKINABE',
 
-  // Europe, Americas, Oceania
+  // Central Asia, Europe, Americas, Oceania
+  UZBEKISTAN: 'UZBEK',
+  UZB: 'UZBEK',
+  UZ: 'UZBEK',
+  UZBEK: 'UZBEK',
+  KAZAKHSTAN: 'KAZAKH',
+  KAZ: 'KAZAKH',
+  KZ: 'KAZAKH',
+  KAZAKH: 'KAZAKH',
+  TAJIKISTAN: 'TAJIK',
+  TJK: 'TAJIK',
+  TJ: 'TAJIK',
+  TAJIK: 'TAJIK',
+  KYRGYZSTAN: 'KYRGYZ',
+  KGZ: 'KYRGYZ',
+  KG: 'KYRGYZ',
+  KYRGYZ: 'KYRGYZ',
+  AZERBAIJAN: 'AZERBAIJANI',
+  AZE: 'AZERBAIJANI',
+  AZ: 'AZERBAIJANI',
+  AZERBAIJANI: 'AZERBAIJANI',
+  IRELAND: 'IRISH',
+  IRL: 'IRISH',
+  IE: 'IRISH',
+  IRISH: 'IRISH',
+  SWEDEN: 'SWEDISH',
+  SWE: 'SWEDISH',
+  SE: 'SWEDISH',
+  SWEDISH: 'SWEDISH',
+  NORWAY: 'NORWEGIAN',
+  NOR: 'NORWEGIAN',
+  NO: 'NORWEGIAN',
+  NORWEGIAN: 'NORWEGIAN',
+  SWITZERLAND: 'SWISS',
+  CHE: 'SWISS',
+  CH: 'SWISS',
+  SWISS: 'SWISS',
+  GREECE: 'GREEK',
+  GRC: 'GREEK',
+  GR: 'GREEK',
+  GREEK: 'GREEK',
+  BELGIUM: 'BELGIAN',
+  BEL: 'BELGIAN',
+  BE: 'BELGIAN',
+  BELGIAN: 'BELGIAN',
+  AUSTRIA: 'AUSTRIAN',
+  AUT: 'AUSTRIAN',
+  AT: 'AUSTRIAN',
+  AUSTRIAN: 'AUSTRIAN',
   'UNITED KINGDOM': 'BRITISH',
   UK: 'BRITISH',
   BRITAIN: 'BRITISH',
@@ -346,13 +433,15 @@ function isPlaceholder(val: string): boolean {
 
 /**
  * Normalizes a person's full name to uppercase Latin letters.
- * Strips Arabic script runs if mixed with English, collapses whitespace, and rejects placeholders.
+ * Prefers printed English when both Arabic and English appear, rejects document boilerplate,
+ * and transliterates Arabic-only names cleanly into uppercase Latin as fallback.
  */
 export function normalizeExtractedName(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
+  const bounded = raw.slice(0, 512);
 
   // Remove Arabic/Urdu Unicode blocks if both Arabic and English were captured together
-  const withoutArabic = raw
+  const withoutArabic = bounded
     .replace(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+/g, ' ')
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '');
@@ -360,31 +449,41 @@ export function normalizeExtractedName(raw: string | null | undefined): string |
   const cleaned = withoutArabic
     .replace(/[^A-Za-z0-9\s.'-]/g, ' ')
     .replace(/\s+/g, ' ')
+    .replace(/^(?:FULL\s+NAME|NAME)\s*[:.-]?\s+/i, '')
     .replace(/^[\s./'-]+|[\s./'-]+$/g, '')
     .trim()
     .toUpperCase();
 
-  if (!cleaned || isPlaceholder(cleaned)) return null;
-  if (!/[A-Z]{2,}/.test(cleaned)) return null;
-  return cleaned;
+  if (cleaned && !isPlaceholder(cleaned) && /[A-Z]{2,}/.test(cleaned) && !LATIN_NAME_BOILERPLATE.has(cleaned)) {
+    return cleaned;
+  }
+
+  if (containsArabicScript(bounded)) {
+    return transliterateArabicNameToLatin(bounded);
+  }
+  return null;
 }
 
 /**
- * Strips spaces and dashes from candidate ID strings and validates non-placeholder content.
+ * Converts Eastern Arabic digits, strips spaces/dashes/labels from candidate ID strings,
+ * and validates non-placeholder content.
  */
 export function normalizeExtractedIdNumber(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
-  if (!trimmed || isPlaceholder(trimmed)) return null;
+  const bounded = raw.slice(0, 256);
+  const asciiDigits = normalizeEasternArabicDigits(bounded)
+    .replace(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+/g, ' ')
+    .replace(/^\s*(?:PASSPORT|IQAMA|NATIONAL\s+ID|VISA|NUMBER|NUM|NO|ID)\s*[:.#-]+\s*/i, '')
+    .trim();
+  if (!asciiDigits || isPlaceholder(asciiDigits)) return null;
 
   // Strip spaces, dashes, underscores, dots
-  const stripped = trimmed.replace(/[\s\-–—_.]+/g, '').toUpperCase();
+  const stripped = asciiDigits.replace(/[\s\-–—_.]+/g, '').toUpperCase();
   if (!stripped || isPlaceholder(stripped)) return null;
 
   // Must contain alphanumeric chars and at least 4 characters (no real passport/iqama/ID/visa is <4 chars)
   const alnum = stripped.replace(/[^A-Z0-9]/g, '');
   if (alnum.length < 4 || !/\d/.test(alnum)) {
-    // Allow purely alpha only if invalid? Real IDs contain digits; check >= 4 alnum with at least 1 digit
     return null;
   }
   return alnum;
@@ -428,39 +527,44 @@ export function pickPriorityId(raw: RawGeminiExtractedDoc): {
 }
 
 /**
- * Normalizes nationality into clean uppercase demonym (e.g., PAKISTANI, INDIAN, SAUDI).
+ * Normalizes nationality into clean uppercase demonym (e.g., PAKISTANI, INDIAN, SAUDI),
+ * supporting both English and Arabic nationality/country names while rejecting city/religion distractors.
  */
 export function normalizeNationalityDemonym(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
+  const bounded = raw.slice(0, 256);
 
-  const cleaned = raw
+  const cleaned = bounded
     .replace(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+/g, ' ')
     .replace(/[^A-Za-z\s/-]/g, ' ')
     .replace(/\s+/g, ' ')
+    .replace(/^(?:NATIONALITY|NAT|COUNTRY)\s*[-:/]?\s*/i, '')
     .trim()
     .toUpperCase();
 
-  if (!cleaned || isPlaceholder(cleaned)) return null;
+  if (cleaned && !isPlaceholder(cleaned)) {
+    // Handle slash-separated bilingual or dual labels like "PAKISTAN / PAKISTANI"
+    const parts = cleaned.split('/').map((p) => p.trim()).filter(Boolean);
+    for (const part of parts) {
+      const key = part.replace(/['.]/g, '').replace(/\s+/g, ' ').trim();
+      if (LATIN_NON_NATIONALITY_DISTRACTORS.has(key) || key.startsWith('NON ') || key.startsWith('NON-')) continue;
+      if (Object.hasOwn(COUNTRY_TO_DEMONYM, key)) {
+        return COUNTRY_TO_DEMONYM[key];
+      }
+    }
 
-  // Handle slash-separated bilingual or dual labels like "PAKISTAN / PAKISTANI"
-  const parts = cleaned.split('/').map((p) => p.trim()).filter(Boolean);
-  for (const part of parts) {
-    const key = part.replace(/['.]/g, '').replace(/\s+/g, ' ').trim();
-    if (COUNTRY_TO_DEMONYM[key]) {
-      return COUNTRY_TO_DEMONYM[key];
+    const wholeKey = cleaned.replace(/['.]/g, '').replace(/\s+/g, ' ').trim();
+    if (!LATIN_NON_NATIONALITY_DISTRACTORS.has(wholeKey) && !wholeKey.startsWith('NON ') && !wholeKey.startsWith('NON-')) {
+      if (Object.hasOwn(COUNTRY_TO_DEMONYM, wholeKey)) {
+        return COUNTRY_TO_DEMONYM[wholeKey];
+      }
+      if (/^[A-Z][A-Z\s-]{2,39}$/.test(wholeKey)) {
+        return wholeKey;
+      }
     }
   }
 
-  const wholeKey = cleaned.replace(/['.]/g, '').replace(/\s+/g, ' ').trim();
-  if (COUNTRY_TO_DEMONYM[wholeKey]) {
-    return COUNTRY_TO_DEMONYM[wholeKey];
-  }
-
-  // Fallback: return clean uppercase token if at least 3 Latin letters
-  if (/^[A-Z][A-Z\s-]{2,39}$/.test(wholeKey)) {
-    return wholeKey;
-  }
-  return null;
+  return lookupArabicNationalityDemonym(bounded);
 }
 
 export function normalizeExtractedDocument(raw: RawGeminiExtractedDoc): NormalizedExtractedDoc {
@@ -474,12 +578,24 @@ export function normalizeExtractedDocument(raw: RawGeminiExtractedDoc): Normaliz
       ? raw.page_number
       : null;
 
+  const primaryName = normalizeExtractedName(raw.name);
+  const arabicFallbackName = normalizeExtractedName(raw.arabic_name);
+  const resolvedName = primaryName ?? arabicFallbackName;
+
+  const primaryNat = normalizeNationalityDemonym(raw.nationality);
+  const arabicNat = normalizeNationalityDemonym(raw.arabic_nationality);
+  // If header text caused primaryNat='SAUDI' while Arabic nationality says non-Saudi (e.g. باكستاني), prefer Arabic nationality
+  const resolvedNationality =
+    arabicNat && arabicNat !== 'SAUDI' && (!primaryNat || primaryNat === 'SAUDI')
+      ? arabicNat
+      : primaryNat ?? arabicNat;
+
   return {
     pageNumber,
-    name: normalizeExtractedName(raw.name),
+    name: resolvedName,
     idNumber,
     idType,
-    nationality: normalizeNationalityDemonym(raw.nationality),
+    nationality: resolvedNationality,
     confidence,
   };
 }

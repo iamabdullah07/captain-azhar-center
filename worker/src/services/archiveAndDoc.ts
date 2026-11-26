@@ -494,20 +494,26 @@ function extractReadableTextFromLegacyDoc(bytes: Uint8Array): string {
     runs.push(asciiRun.trim());
   }
 
-  // Also scan UTF-16LE runs (standard Word Unicode text storage)
+  // Also scan UTF-16LE runs (standard Word Unicode text storage, including Arabic)
   let utf16Run = '';
   for (let i = 0; i + 1 < bytes.length; i += 2) {
     const code = bytes[i] | (bytes[i + 1] << 8);
-    if ((code >= 32 && code <= 126) || code === 9 || code === 10 || code === 13) {
+    const isArabic =
+      (code >= 0x0600 && code <= 0x06ff) ||
+      (code >= 0x0750 && code <= 0x077f) ||
+      (code >= 0x08a0 && code <= 0x08ff) ||
+      (code >= 0xfb50 && code <= 0xfdff) ||
+      (code >= 0xfe70 && code <= 0xfeff);
+    if ((code >= 32 && code <= 126) || isArabic || code === 9 || code === 10 || code === 13) {
       utf16Run += code === 13 ? '\n' : String.fromCharCode(code);
     } else {
-      if (utf16Run.trim().length >= 8 && /[A-Za-z0-9]{4,}/.test(utf16Run)) {
+      if (utf16Run.trim().length >= 4 && /[A-Za-z0-9\u0600-\u06FF]{2,}/.test(utf16Run)) {
         runs.push(utf16Run.trim());
       }
       utf16Run = '';
     }
   }
-  if (utf16Run.trim().length >= 8 && /[A-Za-z0-9]{4,}/.test(utf16Run)) {
+  if (utf16Run.trim().length >= 4 && /[A-Za-z0-9\u0600-\u06FF]{2,}/.test(utf16Run)) {
     runs.push(utf16Run.trim());
   }
 

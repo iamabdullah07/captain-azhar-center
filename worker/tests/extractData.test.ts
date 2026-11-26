@@ -7,9 +7,11 @@ import { createExtractRoutes } from '../src/routes/extract';
 import { cleanupExpiredExtractionFiles } from '../src/services/cleanup';
 import {
   normalizeExtractedDocument,
+  normalizeExtractedName,
   normalizeNationalityDemonym,
   pickPriorityId,
 } from '../src/services/extractionNormalizer';
+import { decodeTextBytesSmart } from '../src/services/geminiExtractor';
 import { createTestEnv } from './helpers/mockCloudflare';
 
 const ENC = new TextEncoder();
@@ -945,5 +947,87 @@ describe('Phase 1: Extraction Normalizer, Model Config, Archives, Key Rotation &
     const cfgAfterClear = await fullApp.request('https://worker.local/api/extract/config', {}, env);
     const cfgJson = (await cfgAfterClear.json()) as { quota: { cooledDownModels?: string[] } };
     expect(cfgJson.quota.cooledDownModels).toEqual([]);
+  });
+
+  it('extracts and normalizes Arabic-only names, nationalities, Eastern Arabic digits, distractors, and Arabic text encodings', async () => {
+    // 1. Arabic-only name transliteration + label stripping
+    expect(normalizeExtractedName('الاسم: محمد بن عبد الله القحطاني')).toBe('MUHAMMAD BIN ABDULLAH AL QAHTANI');
+    expect(normalizeExtractedName('أحمد علي خان')).toBe('AHMAD ALI KHAN');
+
+    // 2. Bilingual name still prefers printed English spelling
+    expect(normalizeExtractedName('محمد علي / Muhammad Ali Khan')).toBe('MUHAMMAD ALI KHAN');
+
+    // 3. Rejects Saudi card header / boilerplate names and falls back to arabic_name
+    expect(normalizeExtractedName('KINGDOM OF SAUDI ARABIA')).toBeNull();
+    expect(normalizeExtractedName('المملكة العربية السعودية')).toBeNull();
+
+    // 4. Arabic nationality demonyms (country, masculine, feminine, prefixed) + distractor rejection
+    expect(normalizeNationalityDemonym('باكستاني')).toBe('PAKISTANI');
+    expect(normalizeNationalityDemonym('باكستانية')).toBe('PAKISTANI');
+    expect(normalizeNationalityDemonym('الجنسية: سوداني')).toBe('SUDANESE');
+    expect(normalizeNationalityDemonym('بنغلاديشي')).toBe('BANGLADESHI');
+    expect(normalizeNationalityDemonym('المملكة العربية السعودية')).toBe('SAUDI');
+    expect(normalizeNationalityDemonym('مصري')).toBe('EGYPTIAN');
+    expect(normalizeNationalityDemonym('يمني')).toBe('YEMENI');
+    expect(normalizeNationalityDemonym('نيبالي')).toBe('NEPALI');
+    expect(normalizeNationalityDemonym('فلبيني')).toBe('FILIPINO');
+    expect(normalizeNationalityDemonym('إثيوبي')).toBe('ETHIOPIAN');
+    expect(normalizeNationalityDemonym('الرياض')).toBeNull();
+    expect(normalizeNationalityDemonym('RIYADH')).toBeNull();
+    expect(normalizeNationalityDemonym('غير سعودي')).toBeNull();
+    expect(normalizeNationalityDemonym('الإسلام')).toBeNull();
+
+    // 5. Saudi Iqama reconciliation: header 'SAUDI' overridden by Arabic nationality 'باكستاني', plus Eastern Arabic digits
+    const iqamaFromArabicCard = normalizeExtractedDocument({
+      arabic_name: 'أحمد سياب رحمن',
+      name: 'KINGDOM OF SAUDI ARABIA',
+      iqama_number: '٢٦٢٧٥٧١٩٧١',
+      arabic_nationality: 'باكستاني',
+      nationality: 'SAUDI',
+      confidence: 0.91,
+    });
+    expect(iqamaFromArabicCard).toMatchObject({
+      name: 'AHMAD SIYAB RAHMAN',
+      idNumber: '2627571971',
+      idType: 'iqama',
+      nationality: 'PAKISTANI',
+    });
+
+    // 6. Saudi National ID without separate Arabic nationality keeps SAUDI
+    const saudiNationalId = normalizeExtractedDocument({
+      arabic_name: 'سعد فهد الدوسري',
+      name: null,
+      national_id_number: '١٠٢٣٤٥٦٧٨٩',
+      arabic_nationality: null,
+      nationality: 'SAUDI',
+    });
+    expect(saudiNationalId).toMatchObject({
+      name: 'SAAD FAHD AL DOSARI',
+      idNumber: '1023456789',
+      idType: 'national_id',
+      nationality: 'SAUDI',
+    });
+
+    // 7. Smart text decoding for UTF-16LE (BOM & BOM-less) Arabic CSV/TXT exports
+    const arabicCsv = 'الاسم,رقم الإقامة,الجنسية\nمحمد علي,2456789012,سوداني';
+    const utf16LeBytes = new Uint8Array(2 + arabicCsv.length * 2);
+    utf16LeBytes[0] = 0xff;
+    utf16LeBytes[1] = 0xfe;
+    for (let i = 0; i < arabicCsv.length; i++) {
+      const code = arabicCsv.charCodeAt(i);
+      utf16LeBytes[2 + i * 2] = code & 0xff;
+      utf16LeBytes[2 + i * 2 + 1] = code >> 8;
+    }
+    expect(decodeTextBytesSmart(utf16LeBytes)).toBe(arabicCsv);
+    expect(decodeTextBytesSmart(utf16LeBytes.subarray(2))).toBe(arabicCsv);
+
+    // Windows-1256 Arabic bytes ("محمد" in CP1256 = E3 CD E3 CF)
+    const cp1256Bytes = new Uint8Array([0xe3, 0xcd, 0xe3, 0xcf]);
+    expect(decodeTextBytesSmart(cp1256Bytes)).toBe('محمد');
+
+    // 8. Security bounds: huge input / repeated prefix / prototype keys do not crash or leak
+    expect(normalizeExtractedName('ال'.repeat(10000))).toBeTruthy();
+    expect(normalizeNationalityDemonym('constructor')).toBeNull();
+    expect(normalizeNationalityDemonym('__proto__')).toBeNull();
   });
 });
